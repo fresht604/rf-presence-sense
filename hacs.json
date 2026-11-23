@@ -1,0 +1,5 @@
+{
+  "name": "RF Presence Sense (Passive Wi-Fi & BLE Localization)",
+  "render_readme": true,
+  "homeassistant": "2024.6.0"
+}

@@ -1,0 +1,46 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "RF Presence Sense — Floorplan & Receivers",
+        "description": "Configure your floorplan dimensions and the 3D position of your existing Wi-Fi router and Home Assistant Bluetooth host. No extra ESP32 or BT proxy is required.",
+        "data": {
+          "floor_width": "Floorplan width (m)",
+          "floor_height": "Floorplan height (m)",
+          "grid_resolution": "RTI grid resolution (m)",
+          "router_x": "Wi-Fi Router X (m)",
+          "router_y": "Wi-Fi Router Y (m)",
+          "router_z": "Wi-Fi Router Height Z (m)",
+          "ha_x": "Home Assistant Host (BLE) X (m)",
+          "ha_y": "Home Assistant Host (BLE) Y (m)",
+          "ha_z": "Home Assistant Host (BLE) Height Z (m)",
+          "update_interval": "Reconstruction interval (s)",
+          "sensitivity": "Detection sensitivity",
+          "enable_wifi_entities": "Use existing Wi-Fi/RF RSSI entities",
+          "enable_ble": "Use native Home Assistant Bluetooth (passive)"
+        }
+      },
+      "devices": {
+        "title": "Select Stationary Wi-Fi & Bluetooth Devices",
+        "description": "Found {wifi_count} Wi-Fi/RF RSSI entities and {ble_count} Bluetooth devices. Select ONLY stationary devices (smart plugs, bulbs, switches, sensors, TVs) — avoid phones or wearables.",
+        "data": {
+          "wifi_entities": "Stationary Wi-Fi / RF RSSI Entities",
+          "ble_devices": "Stationary Bluetooth Devices"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "RF Presence Sense — Tuning",
+        "data": {
+          "sensitivity": "Detection sensitivity",
+          "update_interval": "Reconstruction interval (s)",
+          "enable_wifi_entities": "Use existing Wi-Fi/RF RSSI entities",
+          "enable_ble": "Use native Home Assistant Bluetooth (passive)"
+        }
+      }
+    }
+  }
+}

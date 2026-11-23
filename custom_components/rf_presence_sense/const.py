@@ -1,0 +1,66 @@
+"""Constants for the RF Presence Sense (Device-Free RTI) integration."""
+
+from __future__ import annotations
+
+DOMAIN = "rf_presence_sense"
+NAME = "RF Presence Sense"
+VERSION = "1.0.0"
+
+PLATFORMS = ["sensor", "binary_sensor", "camera"]
+
+# Config entry keys
+CONF_FLOOR_WIDTH = "floor_width"
+CONF_FLOOR_HEIGHT = "floor_height"
+CONF_GRID_RESOLUTION = "grid_resolution"
+CONF_UPDATE_INTERVAL = "update_interval"
+CONF_SENSITIVITY = "sensitivity"
+CONF_RECEIVERS = "receivers"
+CONF_DEVICES = "devices"
+CONF_ROOMS = "rooms"
+CONF_ENABLE_BLE = "enable_ble"
+CONF_ENABLE_WIFI_ENTITIES = "enable_wifi_entities"
+CONF_ACTIVE_POLL_ENTITIES = "active_poll_entities"
+
+# Default geometry & RTI parameters
+DEFAULT_FLOOR_WIDTH = 10.0  # meters
+DEFAULT_FLOOR_HEIGHT = 8.0  # meters
+DEFAULT_GRID_RESOLUTION = 0.5  # meters per voxel
+DEFAULT_UPDATE_INTERVAL = 2.0  # seconds
+DEFAULT_SENSITIVITY = 1.0  # multiplier (0.5 = less sensitive, 2.0 = more sensitive)
+
+# RTI physics defaults (Wilson & Patwari 2010/2011)
+DEFAULT_ELLIPSE_EXCESS_M = 0.35  # Fresnel ellipse excess path width (meters)
+DEFAULT_CORRELATION_DIST_M = 1.6  # Spatial covariance correlation distance (meters)
+DEFAULT_NOISE_VARIANCE = 1.2  # Regularization noise variance (sigma_n^2)
+DEFAULT_SIGNAL_VARIANCE = 1.0  # Prior voxel variance (sigma_x^2)
+DEFAULT_VARIANCE_WEIGHT = 1.5  # Weight for VRTI sliding-window std dev
+DEFAULT_CONSTRUCTIVE_WEIGHT = 0.35  # Weight for constructive multipath spikes
+DEFAULT_BASELINE_ALPHA = 0.015  # Slow EWMA baseline adaptation rate
+DEFAULT_WINDOW_SECONDS = 12.0  # Sliding window for variance/smoothing
+DEFAULT_LINK_STALE_SECONDS = 120.0  # Ignore links silent longer than this
+
+# Human vs. Animal classification thresholds
+LOW_HEIGHT_THRESHOLD_M = 0.90  # Links below this height see pets & human legs
+HUMAN_ATTENUATION_THRESHOLD = 1.85  # Effective attenuation units for human body
+ANIMAL_ATTENUATION_THRESHOLD = 0.65  # Effective attenuation units for pet body
+DETECTION_THRESHOLD_BASE = 0.55  # Base voxel threshold for target detection
+
+# Tracker defaults
+TRACKER_MAX_ASSOC_DIST_M = 2.2
+TRACKER_MIN_HITS = 2
+TRACKER_MAX_MISSED = 4
+
+# Target types
+TARGET_TYPE_HUMAN = "human"
+TARGET_TYPE_ANIMAL = "animal"
+
+# Signal protocols
+PROTOCOL_WIFI = "wifi"
+PROTOCOL_BLE = "ble"
+PROTOCOL_ZIGBEE = "zigbee"
+
+# Service names
+SERVICE_CALIBRATE_EMPTY = "calibrate_empty_room"
+SERVICE_SET_DEVICE_POSITION = "set_device_position"
+SERVICE_DEFINE_ROOM = "define_room"
+SERVICE_RESET_BASELINE = "reset_baseline"

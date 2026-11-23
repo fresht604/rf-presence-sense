@@ -1,0 +1,46 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "RF Presence Sense — Grundriss & Empfänger",
+        "description": "Lege die Größe deines Grundrisses sowie die 3D-Position deines bestehenden WLAN-Routers und des Home-Assistant-Bluetooth-Hosts fest. Kein extra ESP32 oder BT-Proxy nötig.",
+        "data": {
+          "floor_width": "Grundriss Breite (m)",
+          "floor_height": "Grundriss Tiefe (m)",
+          "grid_resolution": "RTI-Rasterauflösung (m)",
+          "router_x": "WLAN-Router X-Position (m)",
+          "router_y": "WLAN-Router Y-Position (m)",
+          "router_z": "WLAN-Router Höhe Z (m)",
+          "ha_x": "Home Assistant (Bluetooth) X-Position (m)",
+          "ha_y": "Home Assistant (Bluetooth) Y-Position (m)",
+          "ha_z": "Home Assistant (Bluetooth) Höhe Z (m)",
+          "update_interval": "Aktualisierungsintervall (s)",
+          "sensitivity": "Empfindlichkeit",
+          "enable_wifi_entities": "Bestehende WLAN/RF RSSI-Entitäten nutzen",
+          "enable_ble": "Natives Home Assistant Bluetooth (passiv) nutzen"
+        }
+      },
+      "devices": {
+        "title": "Stationäre WLAN- & Bluetooth-Geräte wählen",
+        "description": "{wifi_count} WLAN/RF RSSI-Entitäten und {ble_count} Bluetooth-Geräte gefunden. Wähle NUR stationäre Geräte (Steckdosen, Lampen, Schalter, Sensoren, TVs) — keine Handys oder Smartwatches.",
+        "data": {
+          "wifi_entities": "Stationäre WLAN- / RF-RSSI-Entitäten",
+          "ble_devices": "Stationäre Bluetooth-Geräte"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "RF Presence Sense — Feintuning",
+        "data": {
+          "sensitivity": "Empfindlichkeit",
+          "update_interval": "Aktualisierungsintervall (s)",
+          "enable_wifi_entities": "Bestehende WLAN/RF RSSI-Entitäten nutzen",
+          "enable_ble": "Natives Home Assistant Bluetooth (passiv) nutzen"
+        }
+      }
+    }
+  }
+}
