@@ -30,7 +30,11 @@ from .const import (
     PROTOCOL_BLE,
     PROTOCOL_WIFI,
 )
-from .signal_collector import discover_ble_devices, discover_rssi_entities
+from .signal_collector import (
+    discover_ble_devices,
+    discover_rssi_entities,
+    is_likely_stationary,
+)
 
 
 class RFPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -160,20 +164,38 @@ class RFPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
             for eid, meta in self._discovered_wifi.items()
         ]
+        # Only list named BLE devices (skip hundreds of unnamed random-MAC phones)
+        # while still letting the user pick any named BLE device.
+        named_ble = {
+            addr: meta
+            for addr, meta in self._discovered_ble.items()
+            if meta["name"].strip().lower().replace("-", ":") != addr.lower()
+        }
         ble_options = [
             selector.SelectOptionDict(
                 value=addr,
                 label=f"{meta['name']} ({addr}, {meta['rssi']:.0f} dBm)",
             )
-            for addr, meta in self._discovered_ble.items()
+            for addr, meta in sorted(
+                named_ble.items(), key=lambda kv: kv[1]["name"].lower()
+            )
+        ]
+
+        default_wifi = [
+            eid
+            for eid, meta in self._discovered_wifi.items()
+            if is_likely_stationary(meta["name"], eid)
+        ]
+        default_ble = [
+            addr
+            for addr, meta in named_ble.items()
+            if is_likely_stationary(meta["name"], addr)
         ]
 
         fields: dict[Any, Any] = {}
         if wifi_options:
             fields[
-                vol.Optional(
-                    "wifi_entities", default=list(self._discovered_wifi.keys())
-                )
+                vol.Optional("wifi_entities", default=default_wifi)
             ] = selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=wifi_options,
@@ -183,9 +205,7 @@ class RFPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
         if ble_options:
             fields[
-                vol.Optional(
-                    "ble_devices", default=list(self._discovered_ble.keys())
-                )
+                vol.Optional("ble_devices", default=default_ble)
             ] = selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=ble_options,

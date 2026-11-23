@@ -4,7 +4,7 @@ from __future__ import annotations
 
 DOMAIN = "rf_presence_sense"
 NAME = "RF Presence Sense"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 PLATFORMS = ["sensor", "binary_sensor", "camera"]
 

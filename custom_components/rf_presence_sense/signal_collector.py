@@ -40,6 +40,45 @@ RSSI_ENTITY_KEYWORDS = (
     "linkquality",
 )
 
+MOBILE_DEVICE_KEYWORDS = (
+    "handy",
+    "phone",
+    "iphone",
+    "android",
+    "pixel",
+    "watch",
+    "airpods",
+    "buds",
+    "jabra",
+    "headset",
+    "remote",
+    "laptop",
+    "macbook",
+    "ipad",
+    "tablet",
+    "sena",
+    "garmin",
+    "fitbit",
+    "airtag",
+    "smarttag",
+    "-pc",
+    "tim-pc",
+)
+
+
+def is_likely_stationary(name: str, identifier: str) -> bool:
+    """Return True if a discovered Wi-Fi/BLE device looks stationary (not mobile/random-MAC)."""
+    norm_name = (name or "").strip().lower()
+    norm_id = (identifier or "").strip().lower()
+    # Reject unnamed BLE devices whose name is just their MAC address (rotating random MACs)
+    if not norm_name or norm_name == norm_id or norm_name.replace("-", ":") == norm_id:
+        return False
+    # Reject obvious mobile phones, wearables, headsets, remotes, laptops
+    combined = f"{norm_name} {norm_id}"
+    if any(kw in combined for kw in MOBILE_DEVICE_KEYWORDS):
+        return False
+    return True
+
 
 def _parse_float(value: Any) -> float | None:
     """Safely parse a numeric RSSI value."""
