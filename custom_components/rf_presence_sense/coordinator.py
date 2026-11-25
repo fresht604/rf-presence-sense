@@ -24,6 +24,7 @@ from .const import (
     CONF_FLOOR_HEIGHT,
     CONF_FLOOR_WIDTH,
     CONF_GRID_RESOLUTION,
+    CONF_MASK_OUTSIDE_ROOMS,
     CONF_PRESENCE_AWARE_BASELINE,
     CONF_RECEIVERS,
     CONF_ROOMS,
@@ -33,6 +34,7 @@ from .const import (
     DEFAULT_FLOOR_HEIGHT,
     DEFAULT_FLOOR_WIDTH,
     DEFAULT_GRID_RESOLUTION,
+    DEFAULT_MASK_OUTSIDE_ROOMS,
     DEFAULT_PRESENCE_AWARE_BASELINE,
     DEFAULT_SENSITIVITY,
     DEFAULT_UPDATE_INTERVAL,
@@ -41,14 +43,22 @@ from .const import (
     EVENT_TARGET_DETECTED,
     EVENT_TARGET_LOST,
     MAX_LINKS,
+    MAX_REPORTED_FINGERPRINTS,
     MAX_REPORTED_HEATMAP_PEAKS,
     MAX_REPORTED_PERTURBATIONS,
     PROTOCOL_BLE,
     TARGET_TYPE_ANIMAL,
     TARGET_TYPE_HUMAN,
 )
-from .rti_engine import Point3D, RFLink, RTIEngine, RTIReconstruction
-from .signal_collector import SignalCollector, discover_entity_areas
+from .rti_engine import Point3D, RFFingerprint, RFLink, RTIEngine, RTIReconstruction
+from .signal_collector import (
+    SignalCollector,
+    discover_devices_and_receivers_metadata,
+    discover_entity_areas,
+    extract_rssi_from_state,
+    infer_height_from_name,
+    infer_room_from_name,
+)
 from .storage import RFPresenceStorage
 from .tracker import MultiTargetTracker, RoomZone, TrackedTarget
 
@@ -114,6 +124,9 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.presence_aware_baseline = bool(
             cfg.get(CONF_PRESENCE_AWARE_BASELINE, DEFAULT_PRESENCE_AWARE_BASELINE)
         )
+        self.mask_outside_rooms = bool(
+            cfg.get(CONF_MASK_OUTSIDE_ROOMS, DEFAULT_MASK_OUTSIDE_ROOMS)
+        )
         self.away_entity = str(cfg.get(CONF_AWAY_ENTITY, "") or "").strip()
         update_interval = max(
             0.5, float(cfg.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL))
@@ -161,12 +174,16 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
         self.rooms: list[RoomZone] = self._parse_rooms(cfg.get(CONF_ROOMS))
         self.tracker = MultiTargetTracker(rooms=self.rooms)
+        self.engine.set_room_mask(self.rooms, enabled=self.mask_outside_rooms)
 
         self._active_poll_entities: list[str] = list(
             cfg.get(CONF_ACTIVE_POLL_ENTITIES) or []
         )
         self._calibrating = False
         self._calibration_task: asyncio.Task[None] | None = None
+        self._point_cal_task: asyncio.Task[None] | None = None
+        self._edge_walk_task: asyncio.Task[None] | None = None
+        self._edge_walk_state: dict[str, Any] | None = None
         self._shutdown = False
         self._last_update_ts = time.monotonic()
         self._recon_seq: int = 0
@@ -244,11 +261,12 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         if key in ddata:
                             self.devices[target_key][key] = ddata[key]
 
-        # 3. Restore rooms (rectangles or polygons)
+        # 3. Restore rooms (rectangles or polygons, including doors & open_edges)
         stored_rooms = stored.get("rooms")
         if isinstance(stored_rooms, list) and stored_rooms:
             self.rooms = self._parse_rooms(stored_rooms)
             self.tracker.set_rooms(self.rooms)
+            self.engine.set_room_mask(self.rooms, enabled=self.mask_outside_rooms)
 
         # 4. Restore live tuning (only if not overridden explicitly in options)
         stored_tuning = stored.get("tuning")
@@ -275,15 +293,25 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 restored_count,
             )
 
+        # 6. Restore empirical RF calibration fingerprints
+        stored_fps = stored.get("fingerprints")
+        if isinstance(stored_fps, list) and stored_fps:
+            fp_count = self.engine.import_fingerprints(stored_fps)
+            _LOGGER.debug(
+                "Restored %d RF calibration fingerprints from persistent storage",
+                fp_count,
+            )
+
         self._notify_room_listeners()
 
     async def async_save_storage(self) -> None:
-        """Persist current positions, rooms, baselines, and live tuning to disk."""
+        """Persist current positions, rooms, baselines, fingerprints, and live tuning."""
         payload = {
             "devices": self.devices,
             "receivers": self.receivers,
-            "rooms": [room.to_dict() for room in self.rooms],
+            "rooms": [room.to_storage_dict() for room in self.rooms],
             "baselines": self.engine.export_baselines(),
+            "fingerprints": self.engine.export_fingerprints(),
             "tuning": {
                 "sensitivity": round(self.sensitivity, 2),
                 "calibration_duration": int(self.calibration_duration),
@@ -341,6 +369,8 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     x_max=max(x1, x2),
                     y_max=max(y1, y2),
                     polygon=polygon,
+                    open_edges=list(item.get("open_edges") or item.get("oe") or []),
+                    doors=list(item.get("doors") or item.get("dr") or []),
                 )
             )
         return rooms or [
@@ -689,8 +719,10 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         x_max: float,
         y_max: float,
         polygon: list[tuple[float, float]] | list[list[float]] | None = None,
+        open_edges: list[str] | None = None,
+        doors: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Add or update a rectangular or polygon room zone."""
+        """Add or update a rectangular or polygon room zone (with optional doors & passages)."""
         poly_pts: list[tuple[float, float]] | None = None
         if polygon is not None and len(polygon) >= 3:
             poly_pts = [
@@ -712,9 +744,12 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 x_max=max(x1, x2),
                 y_max=max(y1, y2),
                 polygon=poly_pts,
+                open_edges=list(open_edges or []),
+                doors=list(doors or []),
             )
         )
         self.tracker.set_rooms(self.rooms)
+        self.engine.set_room_mask(self.rooms, enabled=self.mask_outside_rooms)
         self._recon_seq += 1
         self._notify_room_listeners()
         self._schedule_save()
@@ -728,6 +763,8 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         x_max: float,
         y_max: float,
         polygon: list[tuple[float, float]] | list[list[float]] | None = None,
+        open_edges: list[str] | None = None,
+        doors: list[dict[str, Any]] | None = None,
     ) -> None:
         """Add or update a room zone and persist immediately."""
         poly_pts: list[tuple[float, float]] | None = None
@@ -751,9 +788,12 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 x_max=max(x1, x2),
                 y_max=max(y1, y2),
                 polygon=poly_pts,
+                open_edges=list(open_edges or []),
+                doors=list(doors or []),
             )
         )
         self.tracker.set_rooms(self.rooms)
+        self.engine.set_room_mask(self.rooms, enabled=self.mask_outside_rooms)
         self._recon_seq += 1
         self._notify_room_listeners()
         await self.async_save_storage()
@@ -765,6 +805,7 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if len(self.rooms) == before:
             return False
         self.tracker.set_rooms(self.rooms)
+        self.engine.set_room_mask(self.rooms, enabled=self.mask_outside_rooms)
         self._recon_seq += 1
         self._notify_room_listeners()
         self._schedule_save()
@@ -777,10 +818,349 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if len(self.rooms) == before:
             return False
         self.tracker.set_rooms(self.rooms)
+        self.engine.set_room_mask(self.rooms, enabled=self.mask_outside_rooms)
         self._recon_seq += 1
         self._notify_room_listeners()
         await self.async_save_storage()
         return True
+
+    def _read_phone_rssi(self, phone_entity: str) -> float | None:
+        """Optionally read an auxiliary phone RSSI entity during walk calibration."""
+        eid = (phone_entity or "").strip()
+        if not eid:
+            return None
+        state = self.hass.states.get(eid)
+        rssi, _ = extract_rssi_from_state(state)
+        return rssi
+
+    async def async_record_calibration_point(
+        self,
+        x: float,
+        y: float,
+        room_id: str = "",
+        duration_seconds: int = 5,
+        label: str = "",
+        phone_entity: str = "",
+    ) -> bool:
+        """Record an empirical RF fingerprint at (x, y) over duration_seconds and persist."""
+        if self._shutdown:
+            return False
+        raw_x, raw_y = float(x), float(y)
+        if not (math.isfinite(raw_x) and math.isfinite(raw_y)):
+            return False
+        dur = max(2, min(30, int(duration_seconds)))
+        px = max(0.0, min(self.floor_width, raw_x))
+        py = max(0.0, min(self.floor_height, raw_y))
+        if not room_id:
+            for room in self.rooms:
+                if room.contains(px, py):
+                    room_id = room.room_id
+                    break
+
+        if self._point_cal_task is not None and not self._point_cal_task.done():
+            self._point_cal_task.cancel()
+            try:
+                await self._point_cal_task
+            except asyncio.CancelledError:
+                pass
+
+        async def _collect() -> bool:
+            samples: list[dict[str, float]] = []
+            phone_vals: list[float] = []
+            ticks = max(2, dur)
+            for idx in range(ticks):
+                if self._shutdown:
+                    return False
+                vec = self.engine.sample_perturbation_vector()
+                if vec:
+                    samples.append(vec)
+                p_rssi = self._read_phone_rssi(phone_entity)
+                if p_rssi is not None:
+                    phone_vals.append(p_rssi)
+                if idx + 1 < ticks:
+                    await asyncio.sleep(1.0)
+
+            if not samples:
+                _LOGGER.debug(
+                    "Calibration point (%.2f, %.2f) had no active perturbations", px, py
+                )
+                return False
+
+            # Average link perturbations across collected ticks
+            sums: dict[str, float] = {}
+            for s in samples:
+                for k, v in s.items():
+                    sums[k] = sums.get(k, 0.0) + v
+            n = len(samples)
+            avg_vec = {k: round(v / n, 3) for k, v in sums.items() if (v / n) > 0.05}
+            if not avg_vec:
+                return False
+
+            avg_phone = (
+                round(sum(phone_vals) / len(phone_vals), 2) if phone_vals else None
+            )
+            fp = RFFingerprint(
+                x=px,
+                y=py,
+                room_id=str(room_id),
+                label=str(label or f"P({px:.1f},{py:.1f})"),
+                vector=avg_vec,
+                phone_rssi=avg_phone,
+            )
+            if self._shutdown:
+                return False
+            self.engine.add_fingerprint(fp)
+            self._recon_seq += 1
+            await self.async_save_storage()
+            await self.async_request_refresh()
+            return True
+
+        task = asyncio.create_task(_collect())
+        self._point_cal_task = task
+        try:
+            return await task
+        except asyncio.CancelledError:
+            return False
+        finally:
+            if self._point_cal_task is task:
+                self._point_cal_task = None
+
+    async def async_start_edge_walk(
+        self,
+        room_id: str,
+        start_x: float,
+        start_y: float,
+        end_x: float,
+        end_y: float,
+        phone_entity: str = "",
+    ) -> None:
+        """Start continuous sampling while the user walks along a room edge."""
+        if self._shutdown:
+            return
+        sx_f, sy_f = float(start_x), float(start_y)
+        ex_f, ey_f = float(end_x), float(end_y)
+        if not all(math.isfinite(v) for v in (sx_f, sy_f, ex_f, ey_f)):
+            return
+        if self._edge_walk_task is not None and not self._edge_walk_task.done():
+            self._edge_walk_task.cancel()
+            try:
+                await self._edge_walk_task
+            except asyncio.CancelledError:
+                pass
+
+        state: dict[str, Any] = {
+            "room_id": str(room_id),
+            "start_x": max(0.0, min(self.floor_width, sx_f)),
+            "start_y": max(0.0, min(self.floor_height, sy_f)),
+            "end_x": max(0.0, min(self.floor_width, ex_f)),
+            "end_y": max(0.0, min(self.floor_height, ey_f)),
+            "phone_entity": str(phone_entity or ""),
+            "samples": [],  # list of (vec, phone_rssi)
+        }
+        self._edge_walk_state = state
+        self._recon_seq += 1
+
+        async def _sampler() -> None:
+            timed_out = False
+            try:
+                # Cap walk at 180 seconds (180 samples) to guard against forgotten stops
+                for _ in range(180):
+                    if self._shutdown or self._edge_walk_state is not state:
+                        return
+                    vec = self.engine.sample_perturbation_vector()
+                    p_rssi = self._read_phone_rssi(state["phone_entity"])
+                    if vec:
+                        state["samples"].append((vec, p_rssi))
+                    await asyncio.sleep(1.0)
+                timed_out = True
+            finally:
+                if timed_out and self._edge_walk_state is state and not self._shutdown:
+                    _LOGGER.info("Edge walk auto-stopped after 180s timeout")
+                    self._edge_walk_state = None
+                    self._edge_walk_task = None
+                    self._recon_seq += 1
+                    await self.async_request_refresh()
+
+        self._edge_walk_task = asyncio.create_task(_sampler())
+        await self.async_request_refresh()
+
+    async def async_stop_edge_walk(self) -> int:
+        """Finish active edge-walk and distribute up to 6 interpolated RF fingerprints."""
+        task = self._edge_walk_task
+        state = self._edge_walk_state
+        self._edge_walk_task = None
+        self._edge_walk_state = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        if not state or self._shutdown:
+            return 0
+
+        # Take one final sample at stop position if none yet
+        final_vec = self.engine.sample_perturbation_vector()
+        if final_vec:
+            state["samples"].append(
+                (final_vec, self._read_phone_rssi(state.get("phone_entity", "")))
+            )
+
+        collected: list[tuple[dict[str, float], float | None]] = state["samples"]
+        if not collected:
+            self._recon_seq += 1
+            await self.async_request_refresh()
+            return 0
+
+        sx, sy = state["start_x"], state["start_y"]
+        ex, ey = state["end_x"], state["end_y"]
+        room_id = state["room_id"]
+        num_buckets = min(6, len(collected))
+        added = 0
+
+        for b_idx in range(num_buckets):
+            lo = int(b_idx * len(collected) / num_buckets)
+            hi = max(lo + 1, int((b_idx + 1) * len(collected) / num_buckets))
+            chunk = collected[lo:hi]
+            sums: dict[str, float] = {}
+            phones: list[float] = []
+            for vec, pr in chunk:
+                for k, v in vec.items():
+                    sums[k] = sums.get(k, 0.0) + v
+                if pr is not None:
+                    phones.append(pr)
+            n = len(chunk)
+            avg_vec = {k: round(v / n, 3) for k, v in sums.items() if (v / n) > 0.05}
+            if not avg_vec:
+                continue
+            t = b_idx / (num_buckets - 1) if num_buckets > 1 else 0.5
+            px = round(sx + t * (ex - sx), 2)
+            py = round(sy + t * (ey - sy), 2)
+            fp = RFFingerprint(
+                x=px,
+                y=py,
+                room_id=room_id,
+                label=f"Edge {room_id} #{b_idx + 1}",
+                vector=avg_vec,
+                phone_rssi=(round(sum(phones) / len(phones), 2) if phones else None),
+            )
+            self.engine.add_fingerprint(fp)
+            added += 1
+
+        self._recon_seq += 1
+        await self.async_save_storage()
+        await self.async_request_refresh()
+        return added
+
+    async def async_clear_fingerprints(self) -> int:
+        """Remove all stored RF calibration fingerprints and persist."""
+        removed = self.engine.clear_fingerprints()
+        self._recon_seq += 1
+        await self.async_save_storage()
+        await self.async_request_refresh()
+        return removed
+
+    async def async_auto_place_from_areas(self) -> dict[str, int]:
+        """Auto-resolve names/areas for all devices & BLE/Shelly scanners and place them in rooms."""
+        meta = discover_devices_and_receivers_metadata(
+            self.hass, self.devices.keys(), self.receivers.keys()
+        )
+        room_map = {r.room_id: r for r in self.rooms}
+
+        # Collect items matched to each configured room: room_id -> list[(kind, item_id, name)]
+        grouped: dict[str, list[tuple[str, str, str]]] = {}
+        matched_devices = 0
+        matched_receivers = 0
+
+        for rid, rdata in self.receivers.items():
+            info = meta.get(rid, {})
+            # Upgrade raw MAC receiver name to human-readable device registry name
+            if info.get("name"):
+                cur_name = str(rdata.get("name", rid))
+                if cur_name == rid or ":" in cur_name:
+                    rdata["name"] = info["name"]
+            if info.get("area"):
+                rdata["area"] = info["area"]
+            rname = str(rdata.get("name", rid))
+            target_room = infer_room_from_name(
+                f"{rname} {rid}", self.rooms, area_hint=str(rdata.get("area", ""))
+            )
+            if target_room and target_room in room_map:
+                grouped.setdefault(target_room, []).append(("receiver", rid, rname))
+                matched_receivers += 1
+
+        for did, ddata in self.devices.items():
+            info = meta.get(did, {})
+            if info.get("name"):
+                cur_name = str(ddata.get("name", did))
+                if cur_name == did or ":" in cur_name:
+                    ddata["name"] = info["name"]
+            if info.get("area"):
+                ddata["area"] = info["area"]
+            dname = str(ddata.get("name", did))
+            target_room = infer_room_from_name(
+                f"{dname} {did}", self.rooms, area_hint=str(ddata.get("area", ""))
+            )
+            if target_room and target_room in room_map:
+                grouped.setdefault(target_room, []).append(("device", did, dname))
+                matched_devices += 1
+
+        # Place grouped devices & receivers neatly inside each room's perimeter (clamped)
+        for room_id, items in grouped.items():
+            room = room_map[room_id]
+            rx_min = max(0.0, min(self.floor_width, room.x_min))
+            rx_max = max(rx_min, min(self.floor_width, room.x_max))
+            ry_min = max(0.0, min(self.floor_height, room.y_min))
+            ry_max = max(ry_min, min(self.floor_height, room.y_max))
+            rw = max(0.2, rx_max - rx_min)
+            rh = max(0.2, ry_max - ry_min)
+            pts = _auto_perimeter_positions(
+                len(items), rw, rh, x_offset=rx_min, y_offset=ry_min
+            )
+            poly_cx = (
+                sum(p[0] for p in room.polygon) / len(room.polygon)
+                if room.polygon
+                else 0.5 * (rx_min + rx_max)
+            )
+            poly_cy = (
+                sum(p[1] for p in room.polygon) / len(room.polygon)
+                if room.polygon
+                else 0.5 * (ry_min + ry_max)
+            )
+            for (kind, item_id, label), (raw_px, raw_py, _default_z) in zip(items, pts):
+                px = round(max(rx_min, min(rx_max, raw_px)), 2)
+                py = round(max(ry_min, min(ry_max, raw_py)), 2)
+                if room.polygon and not room.contains(px, py):
+                    # Pull toward polygon centroid until inside the polygon
+                    for alpha in (0.35, 0.65, 0.9, 1.0):
+                        tx = round(px + alpha * (poly_cx - px), 2)
+                        ty = round(py + alpha * (poly_cy - py), 2)
+                        if room.contains(tx, ty):
+                            px, py = tx, ty
+                            break
+                if kind == "receiver":
+                    z = infer_height_from_name(label, is_receiver=True)
+                    self.receivers[item_id]["x"] = px
+                    self.receivers[item_id]["y"] = py
+                    self.receivers[item_id]["z"] = z
+                else:
+                    proto = str(self.devices[item_id].get("protocol", "wifi"))
+                    z = infer_height_from_name(label, protocol=proto, is_receiver=False)
+                    self.devices[item_id]["x"] = px
+                    self.devices[item_id]["y"] = py
+                    self.devices[item_id]["z"] = z
+
+        if matched_devices > 0 or matched_receivers > 0:
+            self._sync_links_from_config()
+            await self.async_save_storage()
+            await self.async_request_refresh()
+
+        return {
+            "matched_devices": matched_devices,
+            "matched_receivers": matched_receivers,
+            "rooms_populated": len(grouped),
+        }
 
     def _fire_target_events(self, targets: list[TrackedTarget]) -> None:
         """Emit Home Assistant bus events on target detection, room change, and loss."""
@@ -860,7 +1240,7 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     peaks.append((val, (c + 0.5) * res, cy))
         peaks.sort(key=lambda item: item[0], reverse=True)
         return [
-            [round(px, 2), round(py, 2), round(val, 2)]
+            [round(px, 1), round(py, 1), round(val, 1)]
             for val, px, py in peaks[:MAX_REPORTED_HEATMAP_PEAKS]
         ]
 
@@ -939,7 +1319,7 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         dev_idx_map: dict[str, int] = {}
         for did, dev in list(self.devices.items())[:MAX_LINKS]:
             dev_idx_map[did] = len(devices_3d)
-            raw_name = str(dev.get("name", did))[:20]
+            raw_name = str(dev.get("name", did))[:16]
             devices_3d.append(
                 [
                     did,
@@ -1009,15 +1389,24 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "sensitivity": self.sensitivity,
             "calibration_duration": self.calibration_duration,
             "presence_aware_baseline": self.presence_aware_baseline,
+            "mask_outside_rooms": self.mask_outside_rooms,
+            "fingerprint_count": self.engine.fingerprint_count,
+            "edge_walk_active": self._edge_walk_state is not None,
+            "fingerprints_xy": self.engine.snapshot_fingerprints_xy(
+                limit=MAX_REPORTED_FINGERPRINTS
+            ),
         }
 
     def async_shutdown_collector(self) -> None:
-        """Stop all signal collector subscriptions, room listeners, and cancel calibration."""
+        """Stop all signal collector subscriptions, room listeners, and cancel background tasks."""
         self._shutdown = True
         self._calibrating = False
-        if self._calibration_task is not None and not self._calibration_task.done():
-            self._calibration_task.cancel()
-        self._calibration_task = None
+        self._edge_walk_state = None
+        for task_attr in ("_calibration_task", "_point_cal_task", "_edge_walk_task"):
+            task = getattr(self, task_attr, None)
+            if task is not None and not task.done():
+                task.cancel()
+            setattr(self, task_attr, None)
         self._room_listeners.clear()
         self.collector.stop()
 

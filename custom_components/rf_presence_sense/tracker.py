@@ -65,9 +65,49 @@ def _point_in_polygon(x: float, y: float, polygon: list[tuple[float, float]]) ->
     return inside
 
 
+_VALID_EDGES = frozenset({"north", "south", "east", "west"})
+_EDGE_SHORT_TO_FULL = {"n": "north", "s": "south", "e": "east", "w": "west"}
+
+
+def _normalize_edge(raw: Any) -> str | None:
+    s = str(raw or "").strip().lower()
+    if s in _VALID_EDGES:
+        return s
+    return _EDGE_SHORT_TO_FULL.get(s)
+
+
+def _normalize_doors(raw_doors: Any) -> list[dict[str, Any]]:
+    """Validate and cap door definitions per room."""
+    if not isinstance(raw_doors, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in raw_doors[:8]:
+        if isinstance(item, dict):
+            edge = _normalize_edge(item.get("edge") or item.get("e"))
+            if not edge:
+                continue
+            try:
+                pos = max(0.05, min(0.95, float(item.get("pos", item.get("p", 0.5)))))
+                width = max(0.3, min(3.0, float(item.get("width", item.get("w", 0.9)))))
+            except (TypeError, ValueError):
+                continue
+            result.append({"edge": edge, "pos": round(pos, 2), "width": round(width, 2)})
+        elif isinstance(item, (list, tuple)) and len(item) >= 3:
+            edge = _normalize_edge(item[0])
+            if not edge:
+                continue
+            try:
+                pos = max(0.05, min(0.95, float(item[1])))
+                width = max(0.3, min(3.0, float(item[2])))
+            except (TypeError, ValueError):
+                continue
+            result.append({"edge": edge, "pos": round(pos, 2), "width": round(width, 2)})
+    return result
+
+
 @dataclass
 class RoomZone:
-    """Rectangular or arbitrary polygon room zone in floorplan coordinates (meters)."""
+    """Rectangular or arbitrary polygon room zone with optional doors & open passages."""
 
     room_id: str
     name: str
@@ -76,6 +116,8 @@ class RoomZone:
     x_max: float
     y_max: float
     polygon: list[tuple[float, float]] | None = None
+    open_edges: list[str] = field(default_factory=list)
+    doors: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.polygon is not None and len(self.polygon) >= 3:
@@ -95,6 +137,14 @@ class RoomZone:
             self.y_min = min(y1, y2)
             self.y_max = max(y1, y2)
 
+        cleaned_edges: list[str] = []
+        for raw_e in self.open_edges or []:
+            norm_e = _normalize_edge(raw_e)
+            if norm_e and norm_e not in cleaned_edges:
+                cleaned_edges.append(norm_e)
+        self.open_edges = cleaned_edges
+        self.doors = _normalize_doors(self.doors)
+
     def contains(self, x: float, y: float) -> bool:
         """Return True if point (x, y) lies inside this rectangular or polygon room."""
         if not (self.x_min <= x <= self.x_max and self.y_min <= y <= self.y_max):
@@ -104,7 +154,7 @@ class RoomZone:
         return True
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize room definition for persistent storage and 3D Lovelace Card."""
+        """Serialize compact room definition for HA state payload & 3D Lovelace Card."""
         data: dict[str, Any] = {
             "id": self.room_id,
             "name": self.name,
@@ -115,6 +165,28 @@ class RoomZone:
         }
         if self.polygon is not None:
             data["polygon"] = [[round(px, 2), round(py, 2)] for px, py in self.polygon]
+        if self.open_edges:
+            data["oe"] = [e[0] for e in self.open_edges]
+        if self.doors:
+            data["dr"] = [[d["edge"][0], d["pos"], d["width"]] for d in self.doors]
+        return data
+
+    def to_storage_dict(self) -> dict[str, Any]:
+        """Serialize full room definition for persistent JSON storage."""
+        data: dict[str, Any] = {
+            "id": self.room_id,
+            "name": self.name,
+            "x_min": round(self.x_min, 2),
+            "y_min": round(self.y_min, 2),
+            "x_max": round(self.x_max, 2),
+            "y_max": round(self.y_max, 2),
+        }
+        if self.polygon is not None:
+            data["polygon"] = [[round(px, 2), round(py, 2)] for px, py in self.polygon]
+        if self.open_edges:
+            data["open_edges"] = list(self.open_edges)
+        if self.doors:
+            data["doors"] = [dict(d) for d in self.doors]
         return data
 
 

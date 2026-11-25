@@ -110,6 +110,10 @@ class RFTargetsDetailSensor(CoordinatorEntity[RFPresenceCoordinator], SensorEnti
             "sensitivity",
             "calibration_duration",
             "presence_aware_baseline",
+            "mask_outside_rooms",
+            "fingerprint_count",
+            "edge_walk_active",
+            "fingerprints_xy",
         }
     )
 
@@ -142,12 +146,30 @@ class RFTargetsDetailSensor(CoordinatorEntity[RFPresenceCoordinator], SensorEnti
         # Omit nested duplicate 'targets' inside rooms (already exposed at top level)
         raw_rooms = data.get("rooms", {})
         compact_rooms = {
-            rid: {k: v for k, v in rdata.items() if k != "targets"}
+            rid: {
+                k: v
+                for k, v in rdata.items()
+                if k not in ("targets", "name")
+            }
             for rid, rdata in raw_rooms.items()
             if isinstance(rdata, dict)
         }
+        # Keep serialized targets compact so worst-case 16 targets + 80 links +
+        # 80 fingerprints + 8 rooms + peaks stays strictly under HA's 16 KB budget
+        raw_targets = data.get("targets", [])
+        if len(raw_targets) > 4:
+            compact_targets = [
+                (
+                    {**t, "trail": t["trail"][-4:]}
+                    if isinstance(t, dict) and isinstance(t.get("trail"), list)
+                    else t
+                )
+                for t in raw_targets
+            ]
+        else:
+            compact_targets = raw_targets
         return {
-            "targets": data.get("targets", []),
+            "targets": compact_targets,
             "rooms": compact_rooms,
             "rooms_geometry": data.get("rooms_geometry", []),
             "calibrating": data.get("calibrating", False),
@@ -163,6 +185,12 @@ class RFTargetsDetailSensor(CoordinatorEntity[RFPresenceCoordinator], SensorEnti
             "presence_aware_baseline": data.get(
                 "presence_aware_baseline", self.coordinator.presence_aware_baseline
             ),
+            "mask_outside_rooms": data.get(
+                "mask_outside_rooms", self.coordinator.mask_outside_rooms
+            ),
+            "fingerprint_count": data.get("fingerprint_count", 0),
+            "edge_walk_active": data.get("edge_walk_active", False),
+            "fingerprints_xy": data.get("fingerprints_xy", []),
         }
 
 

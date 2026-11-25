@@ -64,6 +64,7 @@ async def async_get_config_entry_diagnostics(
             "sensitivity": coordinator.sensitivity,
             "calibration_duration": coordinator.calibration_duration,
             "presence_aware_baseline": coordinator.presence_aware_baseline,
+            "mask_outside_rooms": coordinator.mask_outside_rooms,
             "away_entity_configured": bool(coordinator.away_entity),
             "update_interval_s": (
                 coordinator.update_interval.total_seconds()
@@ -80,6 +81,8 @@ async def async_get_config_entry_diagnostics(
             "link_health_pct": data.get("link_health_pct", 0.0),
             "humans_count": data.get("humans_count", 0),
             "animals_count": data.get("animals_count", 0),
+            "fingerprint_count": coordinator.engine.fingerprint_count,
+            "edge_walk_active": coordinator._edge_walk_state is not None,
         },
         "rooms": [r.to_dict() for r in coordinator.rooms],
         "receivers_count": len(coordinator.receivers),

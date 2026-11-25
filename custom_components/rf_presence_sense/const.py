@@ -4,7 +4,7 @@ from __future__ import annotations
 
 DOMAIN = "rf_presence_sense"
 NAME = "RF Presence Sense"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 PLATFORMS = ["sensor", "binary_sensor", "camera", "button", "number"]
 
@@ -23,6 +23,7 @@ CONF_ACTIVE_POLL_ENTITIES = "active_poll_entities"
 CONF_PRESENCE_AWARE_BASELINE = "presence_aware_baseline"
 CONF_AWAY_ENTITY = "away_entity"
 CONF_CALIBRATION_DURATION = "calibration_duration"
+CONF_MASK_OUTSIDE_ROOMS = "mask_outside_rooms"
 
 # Default geometry & RTI parameters
 DEFAULT_FLOOR_WIDTH = 10.0  # meters
@@ -32,6 +33,7 @@ DEFAULT_UPDATE_INTERVAL = 2.0  # seconds
 DEFAULT_SENSITIVITY = 1.0  # multiplier (0.5 = less sensitive, 2.0 = more sensitive)
 DEFAULT_CALIBRATION_DURATION = 20  # seconds
 DEFAULT_PRESENCE_AWARE_BASELINE = True
+DEFAULT_MASK_OUTSIDE_ROOMS = True
 
 # RTI physics defaults (Wilson & Patwari 2010/2011)
 DEFAULT_ELLIPSE_EXCESS_M = 0.35  # Fresnel ellipse excess path width (meters)
@@ -57,8 +59,10 @@ DETECTION_THRESHOLD_BASE = 0.55  # Base voxel threshold for target detection
 MAX_VOXELS = 900  # Auto-upscale grid resolution if floorplan exceeds this
 MAX_LINKS = 80  # Cap RF links to bound O(M^3) Cholesky & projection memory
 MAX_CALIBRATION_SAMPLES = 200  # Bounded deque per link during calibration
+MAX_FINGERPRINTS = 120  # Bounded RF calibration fingerprints for hybrid fusion
+MAX_REPORTED_FINGERPRINTS = 80  # Compact [x, y] markers exposed to 3D frontend
 MAX_REPORTED_PERTURBATIONS = 20  # Top-N perturbed links in HA state attributes
-MAX_REPORTED_HEATMAP_PEAKS = 40  # Compact heatmap peaks for 3D Lovelace Card
+MAX_REPORTED_HEATMAP_PEAKS = 30  # Compact heatmap peaks for 3D Lovelace Card
 BLE_MIN_INTERVAL_SECONDS = 0.4  # Minimum interval between BLE samples per link
 
 # Tracker defaults
@@ -89,6 +93,11 @@ SERVICE_SET_DEVICE_POSITION = "set_device_position"
 SERVICE_DEFINE_ROOM = "define_room"
 SERVICE_DELETE_ROOM = "delete_room"
 SERVICE_RESET_BASELINE = "reset_baseline"
+SERVICE_RECORD_CALIBRATION_POINT = "record_calibration_point"
+SERVICE_START_EDGE_WALK = "start_edge_walk"
+SERVICE_STOP_EDGE_WALK = "stop_edge_walk"
+SERVICE_CLEAR_FINGERPRINTS = "clear_fingerprints"
+SERVICE_AUTO_PLACE_FROM_AREAS = "auto_place_from_areas"
 
 # Home Assistant bus event names
 EVENT_ROOM_CHANGED = "rf_presence_sense_room_changed"
@@ -98,6 +107,10 @@ EVENT_TARGET_LOST = "rf_presence_sense_target_lost"
 # Persistent storage
 STORAGE_VERSION = 1
 
-# Frontend static assets (3D Lovelace Card)
+# Frontend static assets & custom sidebar panel
 FRONTEND_URL_BASE = "/rf_presence_sense"
 FRONTEND_CARD_FILENAME = "rf-presence-3d-card.js"
+PANEL_URL_PATH = "rf-presence-3d"
+PANEL_WEBCOMPONENT = "rf-presence-3d-panel"
+PANEL_TITLE = "3D RF-Map"
+PANEL_ICON = "mdi:cube-scan"

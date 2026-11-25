@@ -35,12 +35,42 @@ from .const import (
     DEFAULT_WINDOW_SECONDS,
     LOW_HEIGHT_THRESHOLD_M,
     MAX_CALIBRATION_SAMPLES,
+    MAX_FINGERPRINTS,
     MAX_LINKS,
     MAX_VOXELS,
     PROTOCOL_STALE_SECONDS,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class RFFingerprint:
+    """Empirical RF perturbation fingerprint recorded at a known (x, y) location."""
+
+    x: float
+    y: float
+    vector: dict[str, float]
+    room_id: str = ""
+    label: str = ""
+    phone_rssi: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize fingerprint for persistent storage."""
+        data: dict[str, Any] = {
+            "x": round(float(self.x), 2),
+            "y": round(float(self.y), 2),
+            "room_id": str(self.room_id),
+            "label": str(self.label),
+            "vector": {
+                str(k): round(float(v), 3)
+                for k, v in self.vector.items()
+                if float(v) > 0.05
+            },
+        }
+        if self.phone_rssi is not None:
+            data["phone_rssi"] = round(float(self.phone_rssi), 2)
+        return data
 
 
 @dataclass
@@ -352,6 +382,147 @@ class RTIEngine:
             [0.0] * self.cols for _ in range(self.rows)
         ]
         self._dirty_geometry = True
+
+        # Room mask (True = inside any configured room; None = unmasked)
+        self._voxel_mask: list[bool] | None = None
+        # Empirical RF fingerprints for hybrid RTI + fingerprinting (bounded by MAX_FINGERPRINTS)
+        self._fingerprints: list[RFFingerprint] = []
+
+    def set_room_mask(self, rooms: list[Any] | None, enabled: bool = True) -> None:
+        """Build voxel mask covering only configured rooms (suppresses neighbor ghosts)."""
+        if not enabled or not rooms:
+            with self._lock:
+                self._voxel_mask = None
+            return
+        mask = [
+            any(room.contains(vx, vy) for room in rooms)
+            for vx, vy in self.voxels
+        ]
+        # Only activate mask if at least one voxel falls inside a room
+        with self._lock:
+            self._voxel_mask = mask if any(mask) else None
+
+    def add_fingerprint(self, fp: RFFingerprint) -> None:
+        """Thread-safely store a calibration fingerprint (bounded to MAX_FINGERPRINTS & top 24 links)."""
+        if not fp.vector:
+            return
+        if not (math.isfinite(fp.x) and math.isfinite(fp.y)):
+            return
+        clean_vec = dict(
+            sorted(
+                (
+                    (str(k), round(float(v), 3))
+                    for k, v in fp.vector.items()
+                    if math.isfinite(float(v)) and float(v) > 0.05
+                ),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:24]
+        )
+        if not clean_vec:
+            return
+        bounded_fp = RFFingerprint(
+            x=float(fp.x),
+            y=float(fp.y),
+            room_id=str(fp.room_id),
+            label=str(fp.label),
+            vector=clean_vec,
+            phone_rssi=(
+                float(fp.phone_rssi)
+                if fp.phone_rssi is not None and math.isfinite(float(fp.phone_rssi))
+                else None
+            ),
+        )
+        with self._lock:
+            self._fingerprints.append(bounded_fp)
+            if len(self._fingerprints) > MAX_FINGERPRINTS:
+                self._fingerprints = self._fingerprints[-MAX_FINGERPRINTS:]
+
+    def clear_fingerprints(self) -> int:
+        """Thread-safely clear all stored RF fingerprints; returns count removed."""
+        with self._lock:
+            n = len(self._fingerprints)
+            self._fingerprints.clear()
+            return n
+
+    @property
+    def fingerprint_count(self) -> int:
+        """Current count of stored RF calibration fingerprints."""
+        with self._lock:
+            return len(self._fingerprints)
+
+    def snapshot_fingerprints_xy(self, limit: int = 80) -> list[list[float]]:
+        """Return compact [[x, y], ...] coordinates of stored fingerprints."""
+        with self._lock:
+            return [
+                [round(fp.x, 1), round(fp.y, 1)]
+                for fp in self._fingerprints[-limit:]
+            ]
+
+    def export_fingerprints(self) -> list[dict[str, Any]]:
+        """Thread-safely export fingerprints for persistent storage."""
+        with self._lock:
+            return [fp.to_dict() for fp in self._fingerprints]
+
+    def import_fingerprints(self, raw_items: list[dict[str, Any]]) -> int:
+        """Thread-safely restore persisted RF fingerprints (capped at MAX_FINGERPRINTS)."""
+        loaded: list[RFFingerprint] = []
+        for item in raw_items[-MAX_FINGERPRINTS:]:
+            if not isinstance(item, dict):
+                continue
+            vec = item.get("vector")
+            if not isinstance(vec, dict) or not vec:
+                continue
+            try:
+                fx = float(item["x"])
+                fy = float(item["y"])
+                if not (math.isfinite(fx) and math.isfinite(fy)):
+                    continue
+                clean_vec = dict(
+                    sorted(
+                        (
+                            (str(k), round(float(v), 3))
+                            for k, v in vec.items()
+                            if math.isfinite(float(v)) and float(v) > 0.05
+                        ),
+                        key=lambda kv: kv[1],
+                        reverse=True,
+                    )[:24]
+                )
+                if not clean_vec:
+                    continue
+                phone_val = item.get("phone_rssi")
+                parsed_phone = (
+                    float(phone_val)
+                    if phone_val is not None and math.isfinite(float(phone_val))
+                    else None
+                )
+                loaded.append(
+                    RFFingerprint(
+                        x=fx,
+                        y=fy,
+                        room_id=str(item.get("room_id", "")),
+                        label=str(item.get("label", "")),
+                        vector=clean_vec,
+                        phone_rssi=parsed_phone,
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        with self._lock:
+            self._fingerprints = loaded
+        return len(loaded)
+
+    def sample_perturbation_vector(self, now: float | None = None) -> dict[str, float]:
+        """Thread-safely capture current raw link perturbation vector for fingerprinting."""
+        ts = time.monotonic() if now is None else now
+        vec: dict[str, float] = {}
+        with self._lock:
+            for lid, link in self.links.items():
+                pert, _, _ = link.compute_perturbation(now=ts)
+                if pert > 0.05:
+                    vec[lid] = round(pert, 3)
+        return vec
 
     def add_or_update_link(self, link: RFLink) -> bool:
         """Register or update an RF link, preserving existing signal history.
@@ -684,6 +855,8 @@ class RTIEngine:
             sparse_weights = self._sparse_weights
             low_cov = self._low_coverage
             high_cov = self._high_coverage
+            voxel_mask = self._voxel_mask
+            fingerprints = list(self._fingerprints) if self._fingerprints else []
             m = len(link_order)
 
             if m == 0:
@@ -729,6 +902,8 @@ class RTIEngine:
         high_grid = [[0.0] * self.cols for _ in range(self.rows)]
 
         for v_idx in range(self.num_voxels):
+            if voxel_mask is not None and not voxel_mask[v_idx]:
+                continue
             val = sum(map(mul, Pi[v_idx], delta_y))
             if val > 0.0:
                 r, c = divmod(v_idx, self.cols)
@@ -741,11 +916,62 @@ class RTIEngine:
                 continue
             for v_idx, w_val, is_low in sparse_weights[l_idx]:
                 if w_val > 1e-4:
+                    if voxel_mask is not None and not voxel_mask[v_idx]:
+                        continue
                     r, c = divmod(v_idx, self.cols)
                     if is_low:
                         low_grid[r][c] += w_val * dy
                     else:
                         high_grid[r][c] += w_val * dy
+
+        # Hybrid RTI + RF-Fingerprinting fusion (cosine + L2 similarity boost)
+        if fingerprints and link_perturbations:
+            curr_norm_sq = sum(
+                v * v for v in link_perturbations.values() if math.isfinite(v)
+            )
+            if math.isfinite(curr_norm_sq) and curr_norm_sq > 0.12:  # curr_norm > 0.35
+                curr_norm = math.sqrt(curr_norm_sq)
+                sens = max(0.2, self.sensitivity)
+                scored_fps: list[tuple[float, RFFingerprint]] = []
+                for fp in fingerprints:
+                    fp_vec = fp.vector
+                    fp_norm_sq = sum(
+                        v * v for v in fp_vec.values() if math.isfinite(v)
+                    )
+                    if not math.isfinite(fp_norm_sq) or fp_norm_sq <= 1e-6:
+                        continue
+                    fp_norm = math.sqrt(fp_norm_sq)
+                    dot = 0.0
+                    l2_sq = 0.0
+                    all_keys = set(link_perturbations.keys()) | set(fp_vec.keys())
+                    for k in all_keys:
+                        cv = link_perturbations.get(k, 0.0)
+                        fv = fp_vec.get(k, 0.0) * sens
+                        dot += cv * fv
+                        diff = cv - fv
+                        l2_sq += diff * diff
+                    denom = max(1e-9, curr_norm * fp_norm * sens)
+                    cos_sim = max(0.0, min(1.0, dot / denom))
+                    l2_denom = max(2.5, 0.7 * (curr_norm + fp_norm * sens))
+                    l2_sim = math.exp(-min(40.0, math.sqrt(max(0.0, l2_sq)) / l2_denom))
+                    sim = 0.6 * cos_sim + 0.4 * l2_sim
+                    if math.isfinite(sim) and sim >= 0.45:
+                        scored_fps.append((sim, fp))
+
+                if scored_fps:
+                    scored_fps.sort(key=lambda item: item[0], reverse=True)
+                    sigma_sq = 0.85 * 0.85
+                    boost_scale = min(2.8, curr_norm * 0.48)
+                    for sim, fp in scored_fps[:3]:
+                        amp = sim * boost_scale
+                        fpx, fpy = fp.x, fp.y
+                        for v_idx, (vx, vy) in enumerate(self.voxels):
+                            if voxel_mask is not None and not voxel_mask[v_idx]:
+                                continue
+                            d2 = (vx - fpx) ** 2 + (vy - fpy) ** 2
+                            if d2 <= 4.5:  # within ~2.1m radius
+                                r, c = divmod(v_idx, self.cols)
+                                grid[r][c] += amp * math.exp(-d2 / (2.0 * sigma_sq))
 
         return RTIReconstruction(
             width=self.cols,

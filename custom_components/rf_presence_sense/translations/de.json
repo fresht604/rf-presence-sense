@@ -54,6 +54,7 @@
           "enable_ble": "Natives Home Assistant Bluetooth (passiv) nutzen",
           "active_poll_entities": "Aktive Abfrage-Entitäten (für langsame WLAN-RSSI-Sensoren)",
           "presence_aware_baseline": "Präsenz-bewusste Baseline (kein Drift bei Anwesenheit)",
+          "mask_outside_rooms": "Bereiche außerhalb der Räume ausblenden (Nachbarwohnung ignorieren)",
           "away_entity": "Optionale Abwesenheits-/Präsenz-Entität (z. B. zone.home)"
         }
       },
@@ -183,7 +184,7 @@
     },
     "define_room": {
       "name": "Raumzone definieren",
-      "description": "Definiert oder aktualisiert einen rechteckigen oder Polygon-Raum, speichert ihn dauerhaft und legt sofort Raum-Präsenz-Sensoren an.",
+      "description": "Definiert oder aktualisiert einen rechteckigen oder Polygon-Raum (inkl. Türen & offener Durchgänge), speichert ihn dauerhaft und legt sofort Raum-Präsenz-Sensoren an.",
       "fields": {
         "room_id": { "name": "Raum-ID", "description": "Eindeutige ID ohne Leerzeichen (z. B. wohnzimmer)." },
         "name": { "name": "Raumname", "description": "Anzeigename (z. B. Wohnzimmer)." },
@@ -191,7 +192,9 @@
         "y_min": { "name": "Y Min (m)" },
         "x_max": { "name": "X Max (m)" },
         "y_max": { "name": "Y Max (m)" },
-        "polygon": { "name": "Polygon-Eckpunkte (optional)", "description": "Optionale Liste von [x, y]-Paaren für L-förmige oder freie Räume." }
+        "polygon": { "name": "Polygon-Eckpunkte (optional)", "description": "Optionale Liste von [x, y]-Paaren für L-förmige oder freie Räume." },
+        "open_edges": { "name": "Offene Durchgänge (optional)", "description": "Kanten ohne Wand: north, south, east, west." },
+        "doors": { "name": "Türen (optional)", "description": "Liste von Türöffnungen, z. B. [{edge: south, pos: 0.5, width: 0.9}]." }
       }
     },
     "delete_room": {
@@ -200,6 +203,42 @@
       "fields": {
         "room_id": { "name": "Raum-ID", "description": "ID des zu löschenden Raums." }
       }
+    },
+    "record_calibration_point": {
+      "name": "Kalibrierungs-Messpunkt aufnehmen",
+      "description": "Zeichnet einen empirischen RF-Fingerprint an der Position (x, y) für Hybrid-RTI + Fingerprinting-Ortung auf und speichert ihn dauerhaft.",
+      "fields": {
+        "x": { "name": "X-Position (m)" },
+        "y": { "name": "Y-Position (m)" },
+        "room_id": { "name": "Raum-ID (optional)" },
+        "duration_seconds": { "name": "Messdauer (Sekunden)", "description": "Aufnahmedauer zwischen 2 und 30 Sekunden." },
+        "label": { "name": "Bezeichnung (optional)" },
+        "phone_entity": { "name": "Optionale Handy-RSSI-Entität" }
+      }
+    },
+    "start_edge_walk": {
+      "name": "Kanten-Ablaufen starten (Edge-Walk)",
+      "description": "Startet die kontinuierliche RF-Aufzeichnung, während du langsam entlang einer Raumwand von Start zu Ziel gehst.",
+      "fields": {
+        "room_id": { "name": "Raum-ID" },
+        "start_x": { "name": "Start X (m)" },
+        "start_y": { "name": "Start Y (m)" },
+        "end_x": { "name": "Ziel X (m)" },
+        "end_y": { "name": "Ziel Y (m)" },
+        "phone_entity": { "name": "Optionale Handy-RSSI-Entität" }
+      }
+    },
+    "stop_edge_walk": {
+      "name": "Kanten-Ablaufen abschließen",
+      "description": "Beendet den aktiven Edge-Walk und speichert bis zu 6 interpolierte RF-Fingerprints entlang der abgelaufenen Wand."
+    },
+    "clear_fingerprints": {
+      "name": "Kalibrierungs-Messpunkte löschen",
+      "description": "Löscht alle gespeicherten RF-Fingerprints dauerhaft."
+    },
+    "auto_place_from_areas": {
+      "name": "Geräte & Scanner automatisch aus HA-Areas zuordnen",
+      "description": "Ermittelt Klarnamen und HA-Räume für alle Geräte und Bluetooth-/Shelly-Scanner und platziert sie mit realistischer 3D-Höhe in den passenden Räumen."
     }
   }
 }

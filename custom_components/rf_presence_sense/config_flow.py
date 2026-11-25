@@ -20,6 +20,7 @@ from .const import (
     CONF_FLOOR_HEIGHT,
     CONF_FLOOR_WIDTH,
     CONF_GRID_RESOLUTION,
+    CONF_MASK_OUTSIDE_ROOMS,
     CONF_PRESENCE_AWARE_BASELINE,
     CONF_RECEIVERS,
     CONF_SENSITIVITY,
@@ -27,6 +28,7 @@ from .const import (
     DEFAULT_FLOOR_HEIGHT,
     DEFAULT_FLOOR_WIDTH,
     DEFAULT_GRID_RESOLUTION,
+    DEFAULT_MASK_OUTSIDE_ROOMS,
     DEFAULT_PRESENCE_AWARE_BASELINE,
     DEFAULT_SENSITIVITY,
     DEFAULT_UPDATE_INTERVAL,
@@ -306,6 +308,9 @@ class RFPresenceOptionsFlow(config_entries.OptionsFlow):
             new_options[CONF_PRESENCE_AWARE_BASELINE] = bool(
                 user_input[CONF_PRESENCE_AWARE_BASELINE]
             )
+            new_options[CONF_MASK_OUTSIDE_ROOMS] = bool(
+                user_input[CONF_MASK_OUTSIDE_ROOMS]
+            )
             new_options[CONF_AWAY_ENTITY] = str(
                 user_input.get(CONF_AWAY_ENTITY) or ""
             ).strip()
@@ -394,6 +399,15 @@ class RFPresenceOptionsFlow(config_entries.OptionsFlow):
                         cfg.get(
                             CONF_PRESENCE_AWARE_BASELINE,
                             DEFAULT_PRESENCE_AWARE_BASELINE,
+                        )
+                    ),
+                ): bool,
+                vol.Required(
+                    CONF_MASK_OUTSIDE_ROOMS,
+                    default=bool(
+                        cfg.get(
+                            CONF_MASK_OUTSIDE_ROOMS,
+                            DEFAULT_MASK_OUTSIDE_ROOMS,
                         )
                     ),
                 ): bool,

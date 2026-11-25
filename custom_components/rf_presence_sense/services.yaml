@@ -86,6 +86,14 @@ define_room:
       required: false
       selector:
         object:
+    open_edges:
+      required: false
+      selector:
+        object:
+    doors:
+      required: false
+      selector:
+        object:
 
 delete_room:
   fields:
@@ -93,3 +101,90 @@ delete_room:
       required: true
       selector:
         text:
+
+record_calibration_point:
+  fields:
+    x:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.1
+          unit_of_measurement: m
+    y:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.1
+          unit_of_measurement: m
+    room_id:
+      required: false
+      selector:
+        text:
+    duration_seconds:
+      default: 5
+      selector:
+        number:
+          min: 2
+          max: 30
+          unit_of_measurement: s
+    label:
+      required: false
+      selector:
+        text:
+    phone_entity:
+      required: false
+      selector:
+        entity:
+
+start_edge_walk:
+  fields:
+    room_id:
+      required: true
+      selector:
+        text:
+    start_x:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.1
+          unit_of_measurement: m
+    start_y:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.1
+          unit_of_measurement: m
+    end_x:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.1
+          unit_of_measurement: m
+    end_y:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.1
+          unit_of_measurement: m
+    phone_entity:
+      required: false
+      selector:
+        entity:
+
+stop_edge_walk: {}
+
+clear_fingerprints: {}
+
+auto_place_from_areas: {}

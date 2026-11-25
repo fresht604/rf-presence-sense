@@ -370,6 +370,9 @@ class _RoomSnap:
     vertices: tuple[tuple[float, float], ...]
     cx: float
     cy: float
+    is_rect: bool = True
+    open_edges: tuple[str, ...] = ()
+    doors: tuple[tuple[str, float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -400,6 +403,8 @@ class _RenderSnapshot:
     receivers: tuple[tuple[float, float, float, str], ...]
     targets: tuple[_TargetSnap, ...]
     calibrating: bool
+    edge_walk_active: bool = False
+    fingerprints_xy: tuple[tuple[float, float], ...] = ()
 
 
 def _build_render_snapshot(coordinator: Any) -> _RenderSnapshot:
@@ -429,7 +434,8 @@ def _build_render_snapshot(coordinator: Any) -> _RenderSnapshot:
     rooms_list: list[_RoomSnap] = []
     for room in coordinator.rooms:
         poly = getattr(room, "polygon", None)
-        if poly and len(poly) >= 3:
+        is_rect = not (poly and len(poly) >= 3)
+        if not is_rect:
             verts = tuple((float(pt[0]), float(pt[1])) for pt in poly)
             cx = sum(pt[0] for pt in verts) / len(verts)
             cy = sum(pt[1] for pt in verts) / len(verts)
@@ -442,7 +448,23 @@ def _build_render_snapshot(coordinator: Any) -> _RenderSnapshot:
             )
             cx = 0.5 * (float(room.x_min) + float(room.x_max))
             cy = 0.5 * (float(room.y_min) + float(room.y_max))
-        rooms_list.append(_RoomSnap(name=str(room.name), vertices=verts, cx=cx, cy=cy))
+        raw_oe = tuple(str(e) for e in (getattr(room, "open_edges", None) or ()))
+        raw_dr = tuple(
+            (str(d["edge"]), float(d["pos"]), float(d["width"]))
+            for d in (getattr(room, "doors", None) or ())
+            if isinstance(d, dict) and "edge" in d
+        )
+        rooms_list.append(
+            _RoomSnap(
+                name=str(room.name),
+                vertices=verts,
+                cx=cx,
+                cy=cy,
+                is_rect=is_rect,
+                open_edges=raw_oe,
+                doors=raw_dr,
+            )
+        )
 
     devices_snap = tuple(
         (
@@ -486,6 +508,13 @@ def _build_render_snapshot(coordinator: Any) -> _RenderSnapshot:
             )
         )
 
+    fps_xy: tuple[tuple[float, float], ...] = ()
+    if hasattr(coordinator.engine, "snapshot_fingerprints_xy"):
+        fps_xy = tuple(
+            (float(p[0]), float(p[1]))
+            for p in coordinator.engine.snapshot_fingerprints_xy(limit=80)
+        )
+
     return _RenderSnapshot(
         floor_width=max(float(coordinator.floor_width), 1.0),
         floor_height=max(float(coordinator.floor_height), 1.0),
@@ -496,6 +525,8 @@ def _build_render_snapshot(coordinator: Any) -> _RenderSnapshot:
         receivers=receivers_snap,
         targets=tuple(targets_list),
         calibrating=bool(getattr(coordinator, "_calibrating", False)),
+        edge_walk_active=getattr(coordinator, "_edge_walk_state", None) is not None,
+        fingerprints_xy=fps_xy,
     )
 
 
@@ -625,8 +656,10 @@ def render_heatmap_png_from_snapshot(
         my = proj(fw + 0.35, fh * 0.5, 0.0)
         canvas.draw_text(my[0] - 10, my[1], f"Y:{fh:.0f}M", (148, 163, 184))
 
-    # 3. 3D Room Floors & Translucent 3D Wireframe Walls (z = 0 .. 2.2m)
+    # 3. 3D Room Floors & Translucent 3D Walls with open_edges & doors (z = 0 .. 2.2m)
     wall_h = 2.2
+    door_h = 2.0
+    rect_edge_names = ("north", "east", "south", "west")
     room_palette = [
         (56, 189, 248),
         (129, 140, 248),
@@ -639,18 +672,48 @@ def render_heatmap_png_from_snapshot(
         floor_poly = [proj(vx, vy, 0.0) for vx, vy in room.vertices]
         ceil_poly = [proj(vx, vy, wall_h) for vx, vy in room.vertices]
         # Subtle tinted floor surface per room
-        canvas.fill_polygon(floor_poly, r_col, alpha=0.07)
+        canvas.fill_polygon(floor_poly, r_col, alpha=0.10)
         nv = len(floor_poly)
-        # Back-facing subtle wall tint + wireframe pillars & top edges
+        open_set = set(room.open_edges)
+        doors_by_edge: dict[str, list[tuple[float, float]]] = {}
+        for d_edge, d_pos, d_width in room.doors:
+            doors_by_edge.setdefault(d_edge, []).append((d_pos, d_width))
+
         for i in range(nv):
+            v0 = room.vertices[i]
+            v1 = room.vertices[(i + 1) % nv]
             f0, f1 = floor_poly[i], floor_poly[(i + 1) % nv]
             c0, c1 = ceil_poly[i], ceil_poly[(i + 1) % nv]
-            # Floor edge
-            canvas.draw_line(f0[0], f0[1], f1[0], f1[1], r_col, alpha=0.55)
-            # Vertical 3D corner pillar
-            canvas.draw_line(f0[0], f0[1], c0[0], c0[1], r_col, alpha=0.32, dashed=True)
-            # Ceiling edge
-            canvas.draw_line(c0[0], c0[1], c1[0], c1[1], r_col, alpha=0.28)
+            edge_name = rect_edge_names[i] if (room.is_rect and nv == 4) else ""
+
+            if edge_name and edge_name in open_set:
+                # Open passage: faint floor guide only, no wall!
+                canvas.draw_line(f0[0], f0[1], f1[0], f1[1], r_col, alpha=0.22, dashed=True)
+                continue
+
+            # Floor edge, vertical corner pillar & ceiling edge
+            canvas.draw_line(f0[0], f0[1], f1[0], f1[1], r_col, alpha=0.62)
+            canvas.draw_line(f0[0], f0[1], c0[0], c0[1], r_col, alpha=0.35, dashed=True)
+            canvas.draw_line(c0[0], c0[1], c1[0], c1[1], r_col, alpha=0.30)
+
+            # Door cutouts along this wall edge
+            if edge_name and edge_name in doors_by_edge:
+                edge_len = max(0.1, math.hypot(v1[0] - v0[0], v1[1] - v0[1]))
+                for d_pos, d_width in doors_by_edge[edge_name]:
+                    half_t = min(0.45, (d_width / edge_len) * 0.5)
+                    t_a = max(0.02, d_pos - half_t)
+                    t_b = min(0.98, d_pos + half_t)
+                    ax = v0[0] + t_a * (v1[0] - v0[0])
+                    ay = v0[1] + t_a * (v1[1] - v0[1])
+                    bx = v0[0] + t_b * (v1[0] - v0[0])
+                    by = v0[1] + t_b * (v1[1] - v0[1])
+                    da0, db0 = proj(ax, ay, 0.0), proj(bx, by, 0.0)
+                    da1, db1 = proj(ax, ay, door_h), proj(bx, by, door_h)
+                    door_col = (253, 224, 71)
+                    canvas.draw_line(da0[0], da0[1], da1[0], da1[1], door_col, alpha=0.85)
+                    canvas.draw_line(db0[0], db0[1], db1[0], db1[1], door_col, alpha=0.85)
+                    canvas.draw_line(da1[0], da1[1], db1[0], db1[1], door_col, alpha=0.85)
+
         # Room name label on floor center
         lbl_x, lbl_y = proj(room.cx, room.cy, 0.02)
         short_name = room.name[:14]
@@ -662,6 +725,12 @@ def render_heatmap_png_from_snapshot(
             bg=(15, 23, 42),
             bg_alpha=0.55,
         )
+
+    # 3b. Calibration Fingerprint Markers (green 3D floor diamonds)
+    for fpx, fpy in snap.fingerprints_xy:
+        fx, fy = proj(fpx, fpy, 0.03)
+        diamond = [(fx, fy - 3), (fx + 4, fy), (fx, fy + 3), (fx - 4, fy)]
+        canvas.fill_polygon(diamond, (52, 211, 153), alpha=0.78)
 
     # 4. 3D RTI Heatmap Floor Tiles & Vertical Energy Columns (back-to-front)
     recon = snap.recon
@@ -846,14 +915,20 @@ def render_heatmap_png_from_snapshot(
     )
     canvas.draw_text(10, (header_h - 7) // 2, header_text, (226, 232, 240))
 
-    # Calibrating status banner overlay
-    if snap.calibrating:
-        banner_txt = "KALIBRIERUNG LAEUFT..."
+    # Calibrating or Edge-Walk status banner overlay
+    if snap.calibrating or snap.edge_walk_active:
+        banner_txt = (
+            "KALIBRIERUNG LAEUFT..."
+            if snap.calibrating
+            else "KANTE WIRD ABGELAUFEN..."
+        )
         bw = len(banner_txt) * 6 + 16
         bx = max(8, (w_px - bw) // 2)
         by = header_h + 6
-        canvas.fill_rect(bx, by, bx + bw, by + 17, (217, 119, 6), alpha=0.92)
-        canvas.stroke_rect(bx, by, bx + bw, by + 17, (253, 224, 71), 1)
+        bg_b = (217, 119, 6) if snap.calibrating else (5, 150, 105)
+        bd_b = (253, 224, 71) if snap.calibrating else (110, 231, 183)
+        canvas.fill_rect(bx, by, bx + bw, by + 17, bg_b, alpha=0.92)
+        canvas.stroke_rect(bx, by, bx + bw, by + 17, bd_b, 1)
         canvas.draw_text(bx + 8, by + 5, banner_txt, (255, 255, 255))
 
     # 10. Compact Bottom Legend Bar

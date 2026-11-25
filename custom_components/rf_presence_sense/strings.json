@@ -54,6 +54,7 @@
           "enable_ble": "Use native Home Assistant Bluetooth (passive)",
           "active_poll_entities": "Active polling entities (for slow Wi-Fi RSSI sensors)",
           "presence_aware_baseline": "Presence-aware baseline (freeze drift when occupied)",
+          "mask_outside_rooms": "Mask outside rooms (ignore neighboring apartments)",
           "away_entity": "Optional away/presence entity (e.g. zone.home or input_boolean)"
         }
       },
@@ -183,7 +184,7 @@
     },
     "define_room": {
       "name": "Define room zone",
-      "description": "Creates or updates a rectangular or polygon room zone, persists it, and dynamically adds its room presence binary sensors.",
+      "description": "Creates or updates a rectangular or polygon room zone (with optional doors and open passages), persists it, and dynamically adds its room presence binary sensors.",
       "fields": {
         "room_id": { "name": "Room ID", "description": "Unique identifier without spaces (e.g. living_room)." },
         "name": { "name": "Room Name", "description": "Display name (e.g. Living Room)." },
@@ -191,7 +192,9 @@
         "y_min": { "name": "Y Min (m)" },
         "x_max": { "name": "X Max (m)" },
         "y_max": { "name": "Y Max (m)" },
-        "polygon": { "name": "Polygon Vertices (optional)", "description": "Optional list of [x, y] coordinate pairs for L-shaped or custom rooms." }
+        "polygon": { "name": "Polygon Vertices (optional)", "description": "Optional list of [x, y] coordinate pairs for L-shaped or custom rooms." },
+        "open_edges": { "name": "Open Passages (optional)", "description": "List of edges without walls: north, south, east, west." },
+        "doors": { "name": "Doors (optional)", "description": "List of doorway objects, e.g. [{edge: south, pos: 0.5, width: 0.9}]." }
       }
     },
     "delete_room": {
@@ -200,6 +203,42 @@
       "fields": {
         "room_id": { "name": "Room ID", "description": "ID of the room to delete." }
       }
+    },
+    "record_calibration_point": {
+      "name": "Record calibration point",
+      "description": "Records an empirical RF perturbation fingerprint at a known (x, y) position for hybrid RTI + fingerprinting localization.",
+      "fields": {
+        "x": { "name": "X Position (m)" },
+        "y": { "name": "Y Position (m)" },
+        "room_id": { "name": "Room ID (optional)" },
+        "duration_seconds": { "name": "Duration (seconds)", "description": "Sampling window between 2 and 30 seconds." },
+        "label": { "name": "Label (optional)" },
+        "phone_entity": { "name": "Optional Phone RSSI Entity" }
+      }
+    },
+    "start_edge_walk": {
+      "name": "Start edge walk calibration",
+      "description": "Starts continuous RF sampling while you walk slowly along a room wall edge from start to end.",
+      "fields": {
+        "room_id": { "name": "Room ID" },
+        "start_x": { "name": "Start X (m)" },
+        "start_y": { "name": "Start Y (m)" },
+        "end_x": { "name": "End X (m)" },
+        "end_y": { "name": "End Y (m)" },
+        "phone_entity": { "name": "Optional Phone RSSI Entity" }
+      }
+    },
+    "stop_edge_walk": {
+      "name": "Stop edge walk calibration",
+      "description": "Finishes the active edge walk and persists up to 6 interpolated RF fingerprints along the walked wall."
+    },
+    "clear_fingerprints": {
+      "name": "Clear calibration fingerprints",
+      "description": "Deletes all recorded RF calibration fingerprints from persistent storage."
+    },
+    "auto_place_from_areas": {
+      "name": "Auto-place devices & scanners from HA Areas",
+      "description": "Resolves friendly names and HA Areas for all devices and Bluetooth/Shelly scanners and places them inside their matching configured rooms with realistic 3D heights."
     }
   }
 }

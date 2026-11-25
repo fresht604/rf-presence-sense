@@ -15,12 +15,21 @@ from .const import (
     DOMAIN,
     FRONTEND_CARD_FILENAME,
     FRONTEND_URL_BASE,
+    PANEL_ICON,
+    PANEL_TITLE,
+    PANEL_URL_PATH,
+    PANEL_WEBCOMPONENT,
     PLATFORMS,
+    SERVICE_AUTO_PLACE_FROM_AREAS,
     SERVICE_CALIBRATE_EMPTY,
+    SERVICE_CLEAR_FINGERPRINTS,
     SERVICE_DEFINE_ROOM,
     SERVICE_DELETE_ROOM,
+    SERVICE_RECORD_CALIBRATION_POINT,
     SERVICE_RESET_BASELINE,
     SERVICE_SET_DEVICE_POSITION,
+    SERVICE_START_EDGE_WALK,
+    SERVICE_STOP_EDGE_WALK,
     VERSION,
 )
 from .coordinator import RFPresenceCoordinator
@@ -28,45 +37,85 @@ from .storage import RFPresenceStorage
 
 _LOGGER = logging.getLogger(__name__)
 _FRONTEND_FLAG = f"{DOMAIN}_frontend_registered"
+_PANEL_FLAG = f"{DOMAIN}_panel_registered"
 
 
 async def _async_register_frontend(hass: HomeAssistant) -> None:
-    """Serve the interactive 3D Lovelace Card JS module once per HA instance."""
-    if hass.data.get(_FRONTEND_FLAG):
-        return
-
+    """Serve the interactive 3D Lovelace Card JS module and register sidebar panel."""
     card_path = Path(__file__).parent / "frontend" / FRONTEND_CARD_FILENAME
-    try:
-        exists = await hass.async_add_executor_job(card_path.exists)
-    except Exception:  # noqa: BLE001
-        exists = card_path.exists()
-    if not exists:
-        return
-
     url_path = f"{FRONTEND_URL_BASE}/{FRONTEND_CARD_FILENAME}"
-    http = getattr(hass, "http", None)
-    if http is not None:
+    module_url = f"{url_path}?v={VERSION}"
+
+    if not hass.data.get(_FRONTEND_FLAG):
         try:
-            from homeassistant.components.http import StaticPathConfig  # pylint: disable=import-outside-toplevel
-
-            await http.async_register_static_paths(
-                [StaticPathConfig(url_path, str(card_path), cache_headers=True)]
-            )
+            exists = await hass.async_add_executor_job(card_path.exists)
         except Exception:  # noqa: BLE001
+            exists = card_path.exists()
+        if not exists:
+            return
+
+        http = getattr(hass, "http", None)
+        if http is not None:
             try:
-                http.register_static_path(url_path, str(card_path), cache_headers=True)
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("Could not register static frontend path: %s", err)
-                return
+                from homeassistant.components.http import StaticPathConfig  # pylint: disable=import-outside-toplevel
 
+                await http.async_register_static_paths(
+                    [StaticPathConfig(url_path, str(card_path), cache_headers=True)]
+                )
+            except Exception:  # noqa: BLE001
+                try:
+                    http.register_static_path(
+                        url_path, str(card_path), cache_headers=True
+                    )
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.debug("Could not register static frontend path: %s", err)
+                    return
+
+        try:
+            from homeassistant.components.frontend import add_extra_js_url  # pylint: disable=import-outside-toplevel
+
+            add_extra_js_url(hass, module_url)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Frontend add_extra_js_url skipped: %s", err)
+
+        hass.data[_FRONTEND_FLAG] = True
+
+    if not hass.data.get(_PANEL_FLAG):
+        try:
+            existing_panels = hass.data.get("frontend_panels")
+            if isinstance(existing_panels, dict) and PANEL_URL_PATH in existing_panels:
+                hass.data[_PANEL_FLAG] = True
+            else:
+                from homeassistant.components import panel_custom  # pylint: disable=import-outside-toplevel
+
+                await panel_custom.async_register_panel(
+                    hass,
+                    webcomponent_name=PANEL_WEBCOMPONENT,
+                    frontend_url_path=PANEL_URL_PATH,
+                    sidebar_title=PANEL_TITLE,
+                    sidebar_icon=PANEL_ICON,
+                    module_url=module_url,
+                    embed_iframe=False,
+                    require_admin=False,
+                )
+                hass.data[_PANEL_FLAG] = True
+        except ValueError:
+            # Panel was already registered on this HA instance (e.g. partial reload)
+            hass.data[_PANEL_FLAG] = True
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Sidebar panel registration skipped: %s", err)
+
+
+def _unregister_panel(hass: HomeAssistant) -> None:
+    """Remove the 3D RF-Map sidebar panel when the last config entry unloads."""
+    if not hass.data.pop(_PANEL_FLAG, False):
+        return
     try:
-        from homeassistant.components.frontend import add_extra_js_url  # pylint: disable=import-outside-toplevel
+        from homeassistant.components import frontend  # pylint: disable=import-outside-toplevel
 
-        add_extra_js_url(hass, f"{url_path}?v={VERSION}")
+        frontend.async_remove_panel(hass, PANEL_URL_PATH)
     except Exception as err:  # noqa: BLE001
-        _LOGGER.debug("Frontend add_extra_js_url skipped: %s", err)
-
-    hass.data[_FRONTEND_FLAG] = True
+        _LOGGER.debug("Sidebar panel removal skipped: %s", err)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -79,7 +128,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await coordinator.async_load_storage()
         await coordinator.async_config_entry_first_refresh()
     except Exception:
-        coordinator.async_shutdown_collector()
+        await coordinator.async_shutdown()
         raise
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
@@ -97,7 +146,7 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry and unregister services when the last entry is removed."""
+    """Unload a config entry and clean up services & sidebar panel when last entry unloads."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         domain_data: dict = hass.data.get(DOMAIN, {})
@@ -108,6 +157,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await coordinator.async_shutdown()
         if not domain_data:
             _unregister_services(hass)
+            _unregister_panel(hass)
             hass.data.pop(DOMAIN, None)
     return unload_ok
 
@@ -125,6 +175,11 @@ def _unregister_services(hass: HomeAssistant) -> None:
         SERVICE_SET_DEVICE_POSITION,
         SERVICE_DEFINE_ROOM,
         SERVICE_DELETE_ROOM,
+        SERVICE_RECORD_CALIBRATION_POINT,
+        SERVICE_START_EDGE_WALK,
+        SERVICE_STOP_EDGE_WALK,
+        SERVICE_CLEAR_FINGERPRINTS,
+        SERVICE_AUTO_PLACE_FROM_AREAS,
     ):
         if hass.services.has_service(DOMAIN, service_name):
             hass.services.async_remove(DOMAIN, service_name)
@@ -169,9 +224,19 @@ def _register_services(hass: HomeAssistant) -> None:
         x_max = float(call.data.get("x_max", 0.0))
         y_max = float(call.data.get("y_max", 0.0))
         polygon = call.data.get("polygon")
+        open_edges = call.data.get("open_edges")
+        doors = call.data.get("doors")
         for coord in _get_coordinators(hass):
             await coord.async_define_room(
-                room_id, name, x_min, y_min, x_max, y_max, polygon=polygon
+                room_id,
+                name,
+                x_min,
+                y_min,
+                x_max,
+                y_max,
+                polygon=polygon,
+                open_edges=open_edges,
+                doors=doors,
             )
             await coord.async_request_refresh()
 
@@ -180,6 +245,52 @@ def _register_services(hass: HomeAssistant) -> None:
         for coord in _get_coordinators(hass):
             await coord.async_delete_room(room_id)
             await coord.async_request_refresh()
+
+    async def handle_record_calibration_point(call: ServiceCall) -> None:
+        x = float(call.data["x"])
+        y = float(call.data["y"])
+        room_id = str(call.data.get("room_id", ""))
+        duration = int(call.data.get("duration_seconds", 5))
+        label = str(call.data.get("label", ""))
+        phone_entity = str(call.data.get("phone_entity", ""))
+        for coord in _get_coordinators(hass):
+            await coord.async_record_calibration_point(
+                x=x,
+                y=y,
+                room_id=room_id,
+                duration_seconds=duration,
+                label=label,
+                phone_entity=phone_entity,
+            )
+
+    async def handle_start_edge_walk(call: ServiceCall) -> None:
+        room_id = str(call.data.get("room_id", ""))
+        start_x = float(call.data["start_x"])
+        start_y = float(call.data["start_y"])
+        end_x = float(call.data["end_x"])
+        end_y = float(call.data["end_y"])
+        phone_entity = str(call.data.get("phone_entity", ""))
+        for coord in _get_coordinators(hass):
+            await coord.async_start_edge_walk(
+                room_id=room_id,
+                start_x=start_x,
+                start_y=start_y,
+                end_x=end_x,
+                end_y=end_y,
+                phone_entity=phone_entity,
+            )
+
+    async def handle_stop_edge_walk(call: ServiceCall) -> None:
+        for coord in _get_coordinators(hass):
+            await coord.async_stop_edge_walk()
+
+    async def handle_clear_fingerprints(call: ServiceCall) -> None:
+        for coord in _get_coordinators(hass):
+            await coord.async_clear_fingerprints()
+
+    async def handle_auto_place_from_areas(call: ServiceCall) -> None:
+        for coord in _get_coordinators(hass):
+            await coord.async_auto_place_from_areas()
 
     hass.services.async_register(
         DOMAIN,
@@ -230,6 +341,8 @@ def _register_services(hass: HomeAssistant) -> None:
                     list,
                     [vol.All(list, vol.Length(min=2, max=2), [vol.Coerce(float)])],
                 ),
+                vol.Optional("open_edges"): vol.All(list, [cv.string]),
+                vol.Optional("doors"): list,
             }
         ),
     )
@@ -239,4 +352,56 @@ def _register_services(hass: HomeAssistant) -> None:
         SERVICE_DELETE_ROOM,
         handle_delete_room,
         schema=vol.Schema({vol.Required("room_id"): cv.string}),
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RECORD_CALIBRATION_POINT,
+        handle_record_calibration_point,
+        schema=vol.Schema(
+            {
+                vol.Required("x"): vol.Coerce(float),
+                vol.Required("y"): vol.Coerce(float),
+                vol.Optional("room_id", default=""): cv.string,
+                vol.Optional("duration_seconds", default=5): vol.All(
+                    vol.Coerce(int), vol.Range(min=2, max=30)
+                ),
+                vol.Optional("label", default=""): cv.string,
+                vol.Optional("phone_entity", default=""): cv.string,
+            }
+        ),
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_START_EDGE_WALK,
+        handle_start_edge_walk,
+        schema=vol.Schema(
+            {
+                vol.Optional("room_id", default=""): cv.string,
+                vol.Required("start_x"): vol.Coerce(float),
+                vol.Required("start_y"): vol.Coerce(float),
+                vol.Required("end_x"): vol.Coerce(float),
+                vol.Required("end_y"): vol.Coerce(float),
+                vol.Optional("phone_entity", default=""): cv.string,
+            }
+        ),
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_STOP_EDGE_WALK,
+        handle_stop_edge_walk,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_CLEAR_FINGERPRINTS,
+        handle_clear_fingerprints,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_AUTO_PLACE_FROM_AREAS,
+        handle_auto_place_from_areas,
     )

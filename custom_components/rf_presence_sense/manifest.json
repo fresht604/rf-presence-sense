@@ -4,10 +4,10 @@
   "codeowners": ["@fresht604"],
   "config_flow": true,
   "dependencies": [],
-  "after_dependencies": ["bluetooth", "http", "frontend"],
+  "after_dependencies": ["bluetooth", "http", "frontend", "panel_custom"],
   "documentation": "https://github.com/fresht604/rf-presence-sense",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/fresht604/rf-presence-sense/issues",
   "requirements": [],
-  "version": "2.0.0"
+  "version": "2.1.0"
 }

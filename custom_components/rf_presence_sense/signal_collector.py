@@ -169,11 +169,144 @@ def extract_rssi_from_state(state: State | None) -> tuple[float | None, str]:
     return (None, PROTOCOL_WIFI)
 
 
-def discover_entity_areas(
-    hass: HomeAssistant, entity_ids: Iterable[str]
-) -> dict[str, str]:
-    """Map Home Assistant entity_ids to their assigned HA Area name (if any)."""
-    areas: dict[str, str] = {}
+def _norm_text(value: str) -> str:
+    """Normalize German/English room & device text for fuzzy matching."""
+    return (
+        (value or "")
+        .strip()
+        .lower()
+        .replace("ä", "ae")
+        .replace("ö", "oe")
+        .replace("ü", "ue")
+        .replace("ß", "ss")
+    )
+
+
+def _norm_mac(value: str) -> str:
+    """Normalize a MAC-like identifier to uppercase hex without separators."""
+    cleaned = "".join(ch for ch in (value or "").upper() if ch in "0123456789ABCDEF")
+    return cleaned if len(cleaned) == 12 else ""
+
+
+# Semantic room groups (canonical token -> keywords in device/area/room names)
+_ROOM_SYNONYM_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("bad", "badezimmer", "bath", "bathroom", "wc", "dusche", "bz"),
+    ("arbeitszimmer", "buero", "office", "arbeit", "az", "printer", "drucker", "xp-4200", "xp4200", "desk", "schreibtisch"),
+    ("wohnzimmer", "wohn", "living", "wz", "sofa", "couch", "govee", "fernseher", "tv"),
+    ("kueche", "kitchen", "kue", "fridge", "kuehlschrank", "kuehl", "herd", "ofen", "geschirrspueler"),
+    ("schlafzimmer", "schlaf", "bedroom", "sz", "bett", "bed"),
+    ("eingangsbereich", "eingang", "entrance", "briefkasten", "haustuer", "vorraum"),
+    ("flur", "diele", "gang", "hall", "hallway", "corridor"),
+    ("balkon", "terrasse", "balcony", "garten", "garden"),
+    ("kinderzimmer", "kinder", "kids", "kz"),
+    ("abstellraum", "abstell", "speisekammer", "keller", "basement", "storage"),
+)
+
+
+def _tokenize(text: str) -> set[str]:
+    """Split normalized text into alphanumeric tokens (handles BZ, AZ, WZ cleanly)."""
+    norm = _norm_text(text)
+    tokens: set[str] = set()
+    cur: list[str] = []
+    for ch in norm:
+        if ch.isalnum():
+            cur.append(ch)
+        elif cur:
+            tokens.add("".join(cur))
+            cur = []
+    if cur:
+        tokens.add("".join(cur))
+    return tokens
+
+
+def infer_room_from_name(
+    text: str, rooms: list[Any], area_hint: str = ""
+) -> str | None:
+    """Match a device/receiver name + optional HA area against configured RoomZone list."""
+    if not rooms:
+        return None
+
+    # Build normalized signatures for each configured room
+    room_sigs: list[tuple[str, str, str, set[str], set[int]]] = []
+    for room in rooms:
+        rid = _norm_text(str(getattr(room, "room_id", "")))
+        rname = _norm_text(str(getattr(room, "name", "")))
+        rtokens = _tokenize(f"{rid} {rname}")
+        groups: set[int] = set()
+        for g_idx, group in enumerate(_ROOM_SYNONYM_GROUPS):
+            if any(
+                kw in rtokens or (len(kw) >= 4 and (kw in rname or kw in rid))
+                for kw in group
+            ):
+                groups.add(g_idx)
+        room_sigs.append((str(room.room_id), rid, rname, rtokens, groups))
+
+    # Try HA Area first (highest confidence), then device/receiver display text
+    for candidate in (area_hint, text):
+        cand_norm = _norm_text(candidate)
+        if not cand_norm:
+            continue
+        cand_tokens = _tokenize(cand_norm)
+
+        # 1. Exact or substring match against room name / room_id
+        for room_id, rid, rname, rtokens, _ in room_sigs:
+            if cand_norm == rname or cand_norm == rid:
+                return room_id
+            if len(rname) >= 3 and rname in cand_norm:
+                return room_id
+            if len(rid) >= 3 and rid in cand_norm:
+                return room_id
+            if len(cand_norm) >= 3 and (cand_norm in rname or cand_norm in rid):
+                return room_id
+            if cand_tokens & rtokens:
+                return room_id
+
+        # 2. Synonym group match (e.g. "Thermometer BZ" -> Badezimmer, "XP-4200" -> Arbeitszimmer)
+        cand_groups: set[int] = set()
+        for g_idx, group in enumerate(_ROOM_SYNONYM_GROUPS):
+            for kw in group:
+                if len(kw) <= 3:
+                    if kw in cand_tokens:
+                        cand_groups.add(g_idx)
+                        break
+                elif kw in cand_norm:
+                    cand_groups.add(g_idx)
+                    break
+        if cand_groups:
+            for room_id, _, _, _, r_groups in room_sigs:
+                if cand_groups & r_groups:
+                    return room_id
+
+    return None
+
+
+def infer_height_from_name(
+    name: str, protocol: str = PROTOCOL_WIFI, is_receiver: bool = False
+) -> float:
+    """Estimate realistic 3D mounting height z (in meters) from device name/type."""
+    norm = _norm_text(name)
+    if any(k in norm for k in ("pstrip", "powerstrip", "plug", "steckdose", "outlet", "socket")):
+        return 0.35
+    if any(k in norm for k in ("trv", "thermostat", "heizung", "radiator", "valve")):
+        return 0.55
+    if any(k in norm for k in ("fridge", "kuehlschrank", "kuehl", "printer", "drucker", "xp-4200", "xp4200", "tisch", "desk")):
+        return 1.10
+    if any(k in norm for k in ("lamp", "lampe", "light", "govee", "led", "bulb", "decke", "ceiling", "leuchte")):
+        return 1.65
+    if any(k in norm for k in ("thermometer", "sbdw", "tuer", "door", "fenster", "window", "briefkasten", "sensor", "switch", "schalter", "button", "taster")):
+        return 1.40
+    if is_receiver:
+        return 1.20
+    return 1.0 if protocol == PROTOCOL_WIFI else 0.95
+
+
+def discover_devices_and_receivers_metadata(
+    hass: HomeAssistant,
+    device_ids: Iterable[str],
+    receiver_ids: Iterable[str],
+) -> dict[str, dict[str, str]]:
+    """Resolve friendly names & HA Areas for entities, BLE MACs, and Bluetooth Proxys."""
+    resolved: dict[str, dict[str, str]] = {}
     try:
         from homeassistant.helpers import (  # pylint: disable=import-outside-toplevel
             area_registry as ar,
@@ -185,22 +318,98 @@ def discover_entity_areas(
         dev_reg = dr.async_get(hass)
         area_reg = ar.async_get(hass)
 
-        for eid in entity_ids:
-            ent_entry = ent_reg.async_get(eid)
-            if ent_entry is None:
-                continue
-            area_id = ent_entry.area_id
-            if not area_id and ent_entry.device_id:
-                dev_entry = dev_reg.async_get(ent_entry.device_id)
+        def _area_name(area_id: str | None) -> str:
+            if not area_id or area_reg is None:
+                return ""
+            area_entry = area_reg.async_get_area(area_id)
+            return str(area_entry.name) if area_entry and area_entry.name else ""
+
+        # Build fast MAC -> device_entry lookup across all registered HA devices
+        mac_to_dev: dict[str, Any] = {}
+        name_to_dev: dict[str, Any] = {}
+        raw_devs = getattr(dev_reg, "devices", None) if dev_reg is not None else None
+        for dev_entry in (raw_devs.values() if isinstance(raw_devs, dict) else ()):
+            for _ctype, cval in getattr(dev_entry, "connections", None) or ():
+                nm = _norm_mac(str(cval))
+                if nm:
+                    mac_to_dev[nm] = dev_entry
+            for _dom, ident in getattr(dev_entry, "identifiers", None) or ():
+                s_ident = str(ident)
+                nm = _norm_mac(s_ident)
+                if nm:
+                    mac_to_dev[nm] = dev_entry
+                # Shelly identifiers often look like "shellyplusplugs-aabbccddeeff"
+                if "-" in s_ident:
+                    tail_mac = _norm_mac(s_ident.rsplit("-", 1)[-1])
+                    if tail_mac:
+                        mac_to_dev[tail_mac] = dev_entry
+                name_to_dev[s_ident.lower()] = dev_entry
+            dev_label = getattr(dev_entry, "name_by_user", None) or getattr(dev_entry, "name", None)
+            if dev_label:
+                name_to_dev[str(dev_label).lower()] = dev_entry
+
+        all_ids = list(device_ids) + list(receiver_ids)
+        for item_id in all_ids:
+            info: dict[str, str] = {}
+            # 1. Entity registry match
+            ent_entry = (
+                ent_reg.async_get(item_id)
+                if ent_reg is not None and hasattr(ent_reg, "async_get")
+                else None
+            )
+            if ent_entry is not None:
+                area = _area_name(getattr(ent_entry, "area_id", None))
+                dev_name = ""
+                if getattr(ent_entry, "device_id", None) and dev_reg is not None:
+                    dev_entry = dev_reg.async_get(ent_entry.device_id)
+                    if dev_entry is not None:
+                        if not area:
+                            area = _area_name(dev_entry.area_id)
+                        dev_name = str(
+                            getattr(dev_entry, "name_by_user", None)
+                            or getattr(dev_entry, "name", None)
+                            or ""
+                        )
+                if area:
+                    info["area"] = area
+                if dev_name:
+                    info["name"] = dev_name
+
+            # 2. MAC / Identifier match in device registry (for BLE devices & Shelly BLE Proxys!)
+            if not info.get("area") or not info.get("name"):
+                nm = _norm_mac(item_id)
+                dev_entry = (
+                    mac_to_dev.get(nm)
+                    if nm
+                    else name_to_dev.get(str(item_id).lower())
+                )
                 if dev_entry is not None:
-                    area_id = dev_entry.area_id
-            if area_id:
-                area_entry = area_reg.async_get_area(area_id)
-                if area_entry is not None and area_entry.name:
-                    areas[eid] = str(area_entry.name)
+                    if not info.get("area"):
+                        area = _area_name(getattr(dev_entry, "area_id", None))
+                        if area:
+                            info["area"] = area
+                    if not info.get("name"):
+                        dev_name = str(
+                            getattr(dev_entry, "name_by_user", None)
+                            or getattr(dev_entry, "name", None)
+                            or ""
+                        )
+                        if dev_name:
+                            info["name"] = dev_name
+
+            if info:
+                resolved[item_id] = info
     except Exception as err:  # noqa: BLE001
-        _LOGGER.debug("HA area lookup unavailable: %s", err)
-    return areas
+        _LOGGER.debug("HA device/receiver metadata lookup unavailable: %s", err)
+    return resolved
+
+
+def discover_entity_areas(
+    hass: HomeAssistant, entity_ids: Iterable[str]
+) -> dict[str, str]:
+    """Map Home Assistant entity_ids to their assigned HA Area name (if any)."""
+    meta = discover_devices_and_receivers_metadata(hass, entity_ids, ())
+    return {eid: info["area"] for eid, info in meta.items() if info.get("area")}
 
 
 def discover_rssi_entities(hass: HomeAssistant) -> dict[str, dict[str, Any]]:

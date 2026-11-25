@@ -433,7 +433,7 @@ class TestLiveControls3DMapAndDiagnostics(unittest.TestCase):
             await reset_btn.async_press()
 
             diag = await _diag_mod.async_get_config_entry_diagnostics(hass, entry)
-            self.assertEqual(diag["version"], "2.0.0")
+            self.assertEqual(diag["version"], _const.VERSION)
             self.assertEqual(diag["tuning"]["sensitivity"], 1.8)
             # MAC must be redacted in diagnostics
             link_ids = [item["link_id"] for item in diag["links"]]
