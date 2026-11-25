@@ -95,6 +95,7 @@ class RFTargetsDetailSensor(CoordinatorEntity[RFPresenceCoordinator], SensorEnti
     _attr_has_entity_name = True
     _attr_name = "Positionen & Ziele"
     _attr_icon = "mdi:crosshairs-gps"
+    _unrecorded_attributes = frozenset({"targets", "rooms", "geometry", "calibrating"})
 
     def __init__(
         self, coordinator: RFPresenceCoordinator, entry: ConfigEntry
@@ -138,6 +139,9 @@ class RFLinkHealthSensor(CoordinatorEntity[RFPresenceCoordinator], SensorEntity)
     _attr_icon = "mdi:wifi-check"
     _attr_native_unit_of_measurement = "%"
     _attr_state_class = SensorStateClass.MEASUREMENT
+    _unrecorded_attributes = frozenset(
+        {"active_links", "total_links", "packets_received", "link_perturbations"}
+    )
 
     def __init__(
         self, coordinator: RFPresenceCoordinator, entry: ConfigEntry

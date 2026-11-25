@@ -28,7 +28,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
 
     coordinator = RFPresenceCoordinator(hass, entry)
-    await coordinator.async_config_entry_first_refresh()
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except Exception:
+        coordinator.async_shutdown_collector()
+        raise
+
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -44,12 +49,31 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
+    """Unload a config entry and unregister services when the last entry is removed."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        coordinator: RFPresenceCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
-        coordinator.async_shutdown_collector()
+        domain_data: dict = hass.data.get(DOMAIN, {})
+        coordinator: RFPresenceCoordinator | None = domain_data.pop(
+            entry.entry_id, None
+        )
+        if coordinator is not None:
+            coordinator.async_shutdown_collector()
+        if not domain_data:
+            _unregister_services(hass)
+            hass.data.pop(DOMAIN, None)
     return unload_ok
+
+
+def _unregister_services(hass: HomeAssistant) -> None:
+    """Remove domain services when no config entries remain."""
+    for service_name in (
+        SERVICE_CALIBRATE_EMPTY,
+        SERVICE_RESET_BASELINE,
+        SERVICE_SET_DEVICE_POSITION,
+        SERVICE_DEFINE_ROOM,
+    ):
+        if hass.services.has_service(DOMAIN, service_name):
+            hass.services.async_remove(DOMAIN, service_name)
 
 
 def _get_coordinators(hass: HomeAssistant) -> list[RFPresenceCoordinator]:

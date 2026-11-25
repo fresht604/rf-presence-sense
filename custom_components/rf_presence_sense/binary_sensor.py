@@ -109,6 +109,7 @@ class RFRoomOccupancyBinarySensor(
 
     _attr_device_class = BinarySensorDeviceClass.OCCUPANCY
     _attr_has_entity_name = True
+    _unrecorded_attributes = frozenset({"room_id", "humans", "animals", "targets"})
 
     def __init__(
         self,

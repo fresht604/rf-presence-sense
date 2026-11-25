@@ -27,6 +27,7 @@ from .const import (
     DEFAULT_SENSITIVITY,
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
+    MAX_LINKS,
     PROTOCOL_BLE,
     PROTOCOL_WIFI,
 )
@@ -181,16 +182,32 @@ class RFPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
         ]
 
-        default_wifi = [
-            eid
-            for eid, meta in self._discovered_wifi.items()
-            if is_likely_stationary(meta["name"], eid)
-        ]
-        default_ble = [
-            addr
-            for addr, meta in named_ble.items()
-            if is_likely_stationary(meta["name"], addr)
-        ]
+        wifi_enabled = bool(self._base_config.get(CONF_ENABLE_WIFI_ENTITIES, True))
+        ble_enabled = bool(self._base_config.get(CONF_ENABLE_BLE, True))
+
+        default_wifi = (
+            [
+                eid
+                for eid, meta in self._discovered_wifi.items()
+                if is_likely_stationary(meta["name"], eid)
+            ][:MAX_LINKS]
+            if wifi_enabled
+            else []
+        )
+        remaining_budget = max(0, MAX_LINKS - len(default_wifi))
+        default_ble = (
+            [
+                addr
+                for addr, meta in sorted(
+                    named_ble.items(),
+                    key=lambda kv: kv[1].get("rssi", -100.0),
+                    reverse=True,
+                )
+                if is_likely_stationary(meta["name"], addr)
+            ][:remaining_budget]
+            if ble_enabled and remaining_budget > 0
+            else []
+        )
 
         fields: dict[Any, Any] = {}
         if wifi_options:
@@ -235,7 +252,7 @@ class RFPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class RFPresenceOptionsFlow(config_entries.OptionsFlow):
     """Handle tuning options for RF Presence Sense."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+    def __init__(self, config_entry: config_entries.ConfigEntry | None = None) -> None:
         self._entry = config_entry
 
     async def async_step_init(
@@ -245,7 +262,8 @@ class RFPresenceOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        cfg = {**self._entry.data, **self._entry.options}
+        entry = self._entry if self._entry is not None else self.config_entry
+        cfg = {**entry.data, **entry.options}
         schema = vol.Schema(
             {
                 vol.Required(

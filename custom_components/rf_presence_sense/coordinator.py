@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 import logging
-import math
 import time
 from typing import Any
 
@@ -31,6 +30,8 @@ from .const import (
     DEFAULT_SENSITIVITY,
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
+    MAX_LINKS,
+    MAX_REPORTED_PERTURBATIONS,
     PROTOCOL_BLE,
     TARGET_TYPE_ANIMAL,
     TARGET_TYPE_HUMAN,
@@ -61,7 +62,7 @@ def _auto_perimeter_positions(
             x, y = width - (dist - width - height), height - margin
         else:
             x, y = margin, height - (dist - 2 * width - height)
-        # Alternate low (plug height 0.4m) and high (table/wall height 1.4m) if unknown
+        # Alternate low (plug height 0.45m) and high (table/wall height 1.45m) if unknown
         z = 0.45 if idx % 2 == 0 else 1.45
         positions.append((round(x, 2), round(y, 2), z))
     return positions
@@ -97,6 +98,8 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             resolution=self.grid_resolution,
             sensitivity=self.sensitivity,
         )
+        # Reflect any auto-upscaled resolution back on coordinator
+        self.grid_resolution = self.engine.resolution
 
         self.receivers: dict[str, dict[str, Any]] = dict(
             cfg.get(CONF_RECEIVERS)
@@ -124,7 +127,10 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             cfg.get(CONF_ACTIVE_POLL_ENTITIES) or []
         )
         self._calibrating = False
+        self._calibration_task: asyncio.Task[None] | None = None
+        self._shutdown = False
         self._last_update_ts = time.monotonic()
+        self._recon_seq: int = 0
         self.last_reconstruction: RTIReconstruction | None = None
         self.last_targets: list[TrackedTarget] = []
 
@@ -135,7 +141,14 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             enable_wifi_entities=bool(cfg.get(CONF_ENABLE_WIFI_ENTITIES, True)),
         )
 
+        # Register links without blocking the event loop on matrix inversion;
+        # the first coordinator refresh runs rebuild_projection in executor.
         self._sync_links_from_config()
+
+    @property
+    def recon_seq(self) -> int:
+        """Monotonic sequence number bumped on every reconstruction or geometry update."""
+        return self._recon_seq
 
     def _parse_rooms(self, raw_rooms: Any) -> list[RoomZone]:
         """Parse configured rooms or create a default full-floor room."""
@@ -152,21 +165,27 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ]
         rooms: list[RoomZone] = []
         for item in raw_rooms:
+            x1 = float(item.get("x_min", 0.0))
+            x2 = float(item.get("x_max", self.floor_width))
+            y1 = float(item.get("y_min", 0.0))
+            y2 = float(item.get("y_max", self.floor_height))
             rooms.append(
                 RoomZone(
                     room_id=str(item["id"]),
                     name=str(item.get("name", item["id"])),
-                    x_min=float(item.get("x_min", 0.0)),
-                    y_min=float(item.get("y_min", 0.0)),
-                    x_max=float(item.get("x_max", self.floor_width)),
-                    y_max=float(item.get("y_max", self.floor_height)),
+                    x_min=min(x1, x2),
+                    y_min=min(y1, y2),
+                    x_max=max(x1, x2),
+                    y_max=max(y1, y2),
                 )
             )
         return rooms
 
     def _sync_links_from_config(self) -> None:
-        """Build RFLink objects from configured devices and receivers."""
-        # Assign automatic perimeter positions to any device missing x/y
+        """Build RFLink objects from configured devices and receivers.
+
+        Leaves projection rebuild deferred to the executor thread during refresh.
+        """
         missing = [
             did
             for did, d in self.devices.items()
@@ -216,14 +235,15 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     float(recv.get("z", 1.1)),
                 ),
             )
-            self.engine.add_or_update_link(link)
+            if not self.engine.add_or_update_link(link):
+                continue
 
             if proto == PROTOCOL_BLE:
                 ble_macs.add(device_id.upper())
             else:
                 entity_map[device_id] = recv_id
 
-        self.engine.rebuild_projection()
+        self._recon_seq += 1
         self.collector.configure(entity_map, ble_macs)
 
     def _handle_rssi_sample(
@@ -234,14 +254,20 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         protocol: str,
         ts: float,
     ) -> None:
-        """Ingest a live RSSI reading into the corresponding RFLink."""
-        # Normalize BLE MAC keys
+        """Ingest a live RSSI reading into the corresponding RFLink (thread-safe)."""
+        if self._shutdown:
+            return
         norm_dev = device_id.upper() if protocol == PROTOCOL_BLE else device_id
         link_id = f"{norm_dev}->{receiver_id}"
-        link = self.engine.links.get(link_id)
+
+        if self.engine.ingest_sample(
+            link_id, rssi_dbm, now=ts, calibrating=self._calibrating
+        ):
+            return
 
         # If a BLE device was received by a different adapter/source, auto-create link
-        if link is None and norm_dev in self.devices:
+        # within the MAX_LINKS capacity limit.
+        if norm_dev in self.devices and len(self.engine.links) < MAX_LINKS:
             dev = self.devices[norm_dev]
             if receiver_id not in self.receivers:
                 self.receivers[receiver_id] = {
@@ -263,38 +289,64 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     float(recv["x"]), float(recv["y"]), float(recv.get("z", 1.0))
                 ),
             )
-            self.engine.add_or_update_link(link)
-
-        if link is not None:
-            link.add_sample(rssi_dbm, now=ts, calibrating=self._calibrating)
+            if self.engine.add_or_update_link(link):
+                self.engine.ingest_sample(
+                    link_id, rssi_dbm, now=ts, calibrating=self._calibrating
+                )
 
     async def async_calibrate_empty_room(self, duration_seconds: int = 20) -> None:
         """Record empty-room baseline RSSI and noise floor over duration_seconds."""
+        if self._shutdown:
+            return
         duration = max(5, min(int(duration_seconds), 120))
-        _LOGGER.info(
-            "Starting empty-room RF baseline calibration for %d seconds", duration
-        )
-        for link in self.engine.links.values():
-            link.calibration_samples.clear()
-        self._calibrating = True
+
+        # Cancel any overlapping calibration before starting a fresh one
+        if self._calibration_task is not None and not self._calibration_task.done():
+            self._calibration_task.cancel()
+            try:
+                await self._calibration_task
+            except asyncio.CancelledError:
+                pass
+
+        async def _run_calibration() -> None:
+            _LOGGER.info(
+                "Starting empty-room RF baseline calibration for %d seconds", duration
+            )
+            self.engine.clear_calibration_samples()
+            self._calibrating = True
+            cancelled = False
+            try:
+                await asyncio.sleep(duration)
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            finally:
+                self._calibrating = False
+                if not cancelled and not self._shutdown:
+                    self.engine.finalize_calibration()
+
+            if not self._shutdown:
+                _LOGGER.info("Empty-room RF baseline calibration completed")
+                await self.async_request_refresh()
+
+        task = asyncio.create_task(_run_calibration())
+        self._calibration_task = task
         try:
-            await asyncio.sleep(duration)
+            await task
+        except asyncio.CancelledError:
+            _LOGGER.debug("Empty-room RF baseline calibration cancelled")
         finally:
-            self._calibrating = False
-            for link in self.engine.links.values():
-                link.finalize_calibration()
-        _LOGGER.info("Empty-room RF baseline calibration completed")
-        await self.async_request_refresh()
+            if self._calibration_task is task:
+                self._calibration_task = None
 
     def reset_baseline(self) -> None:
         """Reset all link baselines to their current readings."""
-        for link in self.engine.links.values():
-            link.reset_baseline()
+        self.engine.reset_baselines()
 
     def set_device_position(
         self, device_id: str, x: float, y: float, z: float = 1.0
     ) -> None:
-        """Update (x, y, z) position of a device or receiver and rebuild RTI geometry."""
+        """Update (x, y, z) position of a device or receiver and schedule RTI rebuild."""
         updated = False
         if device_id in self.receivers:
             self.receivers[device_id]["x"] = float(x)
@@ -321,21 +373,24 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         y_max: float,
     ) -> None:
         """Add or update a room zone."""
+        x1, x2 = float(x_min), float(x_max)
+        y1, y2 = float(y_min), float(y_max)
         self.rooms = [r for r in self.rooms if r.room_id != room_id]
         self.rooms.append(
             RoomZone(
                 room_id=room_id,
                 name=name,
-                x_min=float(x_min),
-                y_min=float(y_min),
-                x_max=float(x_max),
-                y_max=float(y_max),
+                x_min=min(x1, x2),
+                y_min=min(y1, y2),
+                x_max=max(x1, x2),
+                y_max=max(y1, y2),
             )
         )
         self.tracker.set_rooms(self.rooms)
+        self._recon_seq += 1
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Run RTI reconstruction and target tracking on each coordinator tick."""
+        """Run RTI reconstruction in executor and target tracking on each tick."""
         now = time.monotonic()
         dt = max(0.2, now - self._last_update_ts)
         self._last_update_ts = now
@@ -352,7 +407,10 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             except Exception as err:  # noqa: BLE001
                 _LOGGER.debug("Active entity poll skipped: %s", err)
 
-        recon = self.engine.reconstruct(now=now)
+        # Offload CPU-bound RTI projection rebuild & reconstruction off the event loop
+        recon: RTIReconstruction = await self.hass.async_add_executor_job(
+            self.engine.reconstruct, now
+        )
         self.last_reconstruction = recon
 
         if self._calibrating:
@@ -360,6 +418,7 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         else:
             targets = self.tracker.update(recon, dt=dt)
         self.last_targets = targets
+        self._recon_seq += 1
 
         humans = [t for t in targets if t.target_type == TARGET_TYPE_HUMAN]
         animals = [t for t in targets if t.target_type == TARGET_TYPE_ANIMAL]
@@ -385,6 +444,19 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else 0.0
         )
 
+        # Report only actively perturbed links (Top-N) to keep HA state objects compact
+        top_perturbations = dict(
+            sorted(
+                (
+                    (lid, val)
+                    for lid, val in recon.link_perturbations.items()
+                    if val > 0.1
+                ),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:MAX_REPORTED_PERTURBATIONS]
+        )
+
         return {
             "calibrating": self._calibrating,
             "humans_count": len(humans),
@@ -396,10 +468,15 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "total_links": recon.total_links,
             "link_health_pct": link_health_pct,
             "packets_received": self.collector.packet_count,
-            "link_perturbations": recon.link_perturbations,
+            "link_perturbations": top_perturbations,
             "geometry": self.engine.get_geometry_summary(),
         }
 
     def async_shutdown_collector(self) -> None:
-        """Stop all signal collector subscriptions."""
+        """Stop all signal collector subscriptions and cancel running calibration."""
+        self._shutdown = True
+        self._calibrating = False
+        if self._calibration_task is not None and not self._calibration_task.done():
+            self._calibration_task.cancel()
+        self._calibration_task = None
         self.collector.stop()

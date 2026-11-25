@@ -4,7 +4,7 @@ from __future__ import annotations
 
 DOMAIN = "rf_presence_sense"
 NAME = "RF Presence Sense"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 PLATFORMS = ["sensor", "binary_sensor", "camera"]
 
@@ -45,10 +45,18 @@ HUMAN_ATTENUATION_THRESHOLD = 1.85  # Effective attenuation units for human body
 ANIMAL_ATTENUATION_THRESHOLD = 0.65  # Effective attenuation units for pet body
 DETECTION_THRESHOLD_BASE = 0.55  # Base voxel threshold for target detection
 
+# Resource & stability limits (prevent OOM / event-loop stalls on ARM SBCs)
+MAX_VOXELS = 900  # Auto-upscale grid resolution if floorplan exceeds this
+MAX_LINKS = 80  # Cap RF links to bound O(M^3) Cholesky & projection memory
+MAX_CALIBRATION_SAMPLES = 200  # Bounded deque per link during calibration
+MAX_REPORTED_PERTURBATIONS = 20  # Top-N perturbed links in HA state attributes
+BLE_MIN_INTERVAL_SECONDS = 0.4  # Minimum interval between BLE samples per link
+
 # Tracker defaults
 TRACKER_MAX_ASSOC_DIST_M = 2.2
 TRACKER_MIN_HITS = 2
 TRACKER_MAX_MISSED = 4
+TRACKER_MAX_TRACKS = 16
 
 # Target types
 TARGET_TYPE_HUMAN = "human"

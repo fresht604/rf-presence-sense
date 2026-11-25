@@ -20,9 +20,18 @@ from .const import (
     TARGET_TYPE_HUMAN,
     TRACKER_MAX_ASSOC_DIST_M,
     TRACKER_MAX_MISSED,
+    TRACKER_MAX_TRACKS,
     TRACKER_MIN_HITS,
 )
 from .rti_engine import RTIReconstruction
+
+MAX_TRACKS = TRACKER_MAX_TRACKS
+
+
+def _sigmoid(x: float) -> float:
+    """Numerically safe logistic sigmoid (prevents math.exp OverflowError)."""
+    clamped = max(-40.0, min(40.0, x))
+    return 1.0 / (1.0 + math.exp(-clamped))
 
 
 @dataclass
@@ -109,6 +118,7 @@ def extract_peaks(
     recon: RTIReconstruction,
     threshold: float = DETECTION_THRESHOLD_BASE,
     min_separation_m: float = 1.2,
+    max_peaks: int = MAX_TRACKS,
 ) -> list[DetectionPeak]:
     """Extract sub-voxel local maxima from an RTI attenuation grid."""
     grid = recon.grid
@@ -199,6 +209,8 @@ def extract_peaks(
                 high_coverage=high_cov,
             )
         )
+        if len(peaks) >= max_peaks:
+            break
 
     return peaks
 
@@ -217,11 +229,11 @@ def classify_peak_human_score(peak: DetectionPeak) -> tuple[float, float]:
     mid_atten = 0.5 * (HUMAN_ATTENUATION_THRESHOLD + ANIMAL_ATTENUATION_THRESHOLD)
     span_atten = max(0.3, HUMAN_ATTENUATION_THRESHOLD - ANIMAL_ATTENUATION_THRESHOLD)
     z_atten = (peak.intensity - mid_atten) / (0.5 * span_atten)
-    score_atten = 1.0 / (1.0 + math.exp(-2.2 * z_atten))
+    score_atten = _sigmoid(2.2 * z_atten)
 
     # Cue 2: Footprint area (pets ~ 0.25-0.75 m^2, humans ~ 1.0-2.5 m^2)
     z_area = (peak.footprint_area_m2 - 0.95) / 0.55
-    score_area = 1.0 / (1.0 + math.exp(-1.8 * z_area))
+    score_area = _sigmoid(1.8 * z_area)
 
     # Cue 3: 3D vertical layer discrimination (strongest cue when both layers exist)
     has_low_cov = peak.low_coverage > 0.05
@@ -235,7 +247,7 @@ def classify_peak_human_score(peak: DetectionPeak) -> tuple[float, float]:
             high_ratio = norm_high / total_norm
             # Humans typically trigger high links strongly (high_ratio >= 0.35),
             # while small pets leave high links quiet (high_ratio < 0.20).
-            score_3d = 1.0 / (1.0 + math.exp(-8.0 * (high_ratio - 0.28)))
+            score_3d = _sigmoid(8.0 * (high_ratio - 0.28))
             human_prob = 0.55 * score_3d + 0.30 * score_atten + 0.15 * score_area
             confidence = min(0.98, 0.55 + 0.43 * abs(2.0 * human_prob - 1.0))
             return (human_prob, confidence)
@@ -256,12 +268,14 @@ class MultiTargetTracker:
         max_assoc_dist: float = TRACKER_MAX_ASSOC_DIST_M,
         min_hits: int = TRACKER_MIN_HITS,
         max_missed: int = TRACKER_MAX_MISSED,
+        max_tracks: int = MAX_TRACKS,
     ) -> None:
         self.rooms: list[RoomZone] = rooms or []
         self.detection_threshold = detection_threshold
         self.max_assoc_dist = max_assoc_dist
         self.min_hits = min_hits
         self.max_missed = max_missed
+        self.max_tracks = max(1, int(max_tracks))
         self._tracks: dict[int, TrackedTarget] = {}
         self._next_id = 1
 
@@ -278,7 +292,11 @@ class MultiTargetTracker:
     def update(self, recon: RTIReconstruction, dt: float = 2.0) -> list[TrackedTarget]:
         """Run one predict-associate-update cycle and return confirmed targets."""
         dt = max(0.2, min(dt, 15.0))
-        peaks = extract_peaks(recon, threshold=self.detection_threshold)
+        peaks = extract_peaks(
+            recon,
+            threshold=self.detection_threshold,
+            max_peaks=self.max_tracks,
+        )
 
         # 1. Predict all existing tracks (Constant-Velocity + damping)
         for track in self._tracks.values():
@@ -348,10 +366,12 @@ class MultiTargetTracker:
         for tid in to_delete:
             del self._tracks[tid]
 
-        # 4. Spawn new tentative tracks for unmatched peaks
+        # 4. Spawn new tentative tracks for unmatched peaks (bounded by max_tracks)
         for pidx, peak in enumerate(peaks):
             if pidx in matched_peaks:
                 continue
+            if len(self._tracks) >= self.max_tracks:
+                break
             inst_human, inst_conf = classify_peak_human_score(peak)
             room_id, room_name = self._find_room(peak.x, peak.y)
             new_track = TrackedTarget(

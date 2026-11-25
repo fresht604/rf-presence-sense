@@ -18,7 +18,12 @@ from typing import Any
 from homeassistant.core import Event, HomeAssistant, State, callback
 from homeassistant.helpers.event import async_track_state_change_event
 
-from .const import PROTOCOL_BLE, PROTOCOL_WIFI, PROTOCOL_ZIGBEE
+from .const import (
+    BLE_MIN_INTERVAL_SECONDS,
+    PROTOCOL_BLE,
+    PROTOCOL_WIFI,
+    PROTOCOL_ZIGBEE,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -204,6 +209,7 @@ class SignalCollector:
         on_sample: Callable[[str, str, float, str, float], None],
         enable_ble: bool = True,
         enable_wifi_entities: bool = True,
+        ble_min_interval: float = BLE_MIN_INTERVAL_SECONDS,
     ) -> None:
         """Initialize the signal collector.
 
@@ -214,12 +220,28 @@ class SignalCollector:
         self._on_sample = on_sample
         self._enable_ble = enable_ble
         self._enable_wifi_entities = enable_wifi_entities
+        self._ble_min_interval = max(0.0, float(ble_min_interval))
 
         self._tracked_entities: dict[str, str] = {}  # entity_id -> receiver_id
-        self._tracked_ble_macs: set[str] = set()  # uppercase MACs (empty = accept all configured)
+        self._tracked_ble_macs: set[str] = set()  # uppercase MACs
+        self._last_ble_ts: dict[tuple[str, str], float] = {}
         self._unsub_state: Callable[[], None] | None = None
         self._unsub_ble: Callable[[], None] | None = None
         self._packet_count = 0
+
+    def _should_accept_ble(self, addr: str, source: str, now: float) -> bool:
+        """Rate-limit high-frequency BLE advertisements per (MAC, adapter) link."""
+        key = (addr, source)
+        last_ts = self._last_ble_ts.get(key)
+        if last_ts is not None and (now - last_ts) < self._ble_min_interval:
+            return False
+        if len(self._last_ble_ts) > 256:
+            cutoff = now - max(60.0, self._ble_min_interval * 10.0)
+            self._last_ble_ts = {
+                k: ts for k, ts in self._last_ble_ts.items() if ts >= cutoff
+            }
+        self._last_ble_ts[key] = now
+        return True
 
     @property
     def packet_count(self) -> int:
@@ -277,14 +299,17 @@ class SignalCollector:
                     return
                 if service_info.rssi is None:
                     return
-                source = getattr(service_info, "source", None) or "ha_bluetooth"
+                source = str(getattr(service_info, "source", None) or "ha_bluetooth")
+                now = time.monotonic()
+                if not self._should_accept_ble(addr, source, now):
+                    return
                 self._packet_count += 1
                 self._on_sample(
                     addr,
-                    str(source),
+                    source,
                     float(service_info.rssi),
                     PROTOCOL_BLE,
-                    time.monotonic(),
+                    now,
                 )
 
             self._unsub_ble = bluetooth.async_register_callback(
@@ -323,10 +348,11 @@ class SignalCollector:
         )
 
     def stop(self) -> None:
-        """Unsubscribe all listeners."""
+        """Unsubscribe all listeners and release rate-limit state."""
         if self._unsub_state is not None:
             self._unsub_state()
             self._unsub_state = None
         if self._unsub_ble is not None:
             self._unsub_ble()
             self._unsub_ble = None
+        self._last_ble_ts.clear()
