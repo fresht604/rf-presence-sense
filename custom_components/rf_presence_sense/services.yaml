@@ -1,40 +1,21 @@
 calibrate_empty_room:
-  name: Leeren Raum kalibrieren
-  description: >-
-    Misst die ungestörte RSSI-Baseline und das Grundrauschen aller WLAN- und
-    Bluetooth-Links. Während der Kalibrierung sollte sich kein Mensch oder Tier
-    im überwachten Bereich befinden.
   fields:
     duration_seconds:
-      name: Dauer (Sekunden)
-      description: Messdauer für die Baseline-Kalibrierung (5 bis 120 Sekunden).
-      default: 20
       selector:
         number:
           min: 5
           max: 120
           unit_of_measurement: s
 
-reset_baseline:
-  name: Baseline zurücksetzen
-  description: >-
-    Setzt die adaptive RSSI-Baseline aller Links sofort auf die aktuellen Messwerte zurück.
+reset_baseline: {}
 
 set_device_position:
-  name: Geräteposition (3D) festlegen
-  description: >-
-    Legt die exakte (x, y, z) Position in Metern für ein stationäres WLAN-/BLE-Gerät
-    oder einen Empfänger (z. B. router_main, ha_bluetooth) fest. Die Höhe z hilft bei
-    der Unterscheidung zwischen Menschen (>= 0.9 m) und Tieren (< 0.9 m).
   fields:
     device_id:
-      name: Geräte- oder Empfänger-ID
-      description: Entity-ID (z. B. sensor.shelly_rssi), BLE-MAC oder Empfänger-ID (router_main).
       required: true
       selector:
         text:
     x:
-      name: X-Position (Meter)
       required: true
       selector:
         number:
@@ -43,7 +24,6 @@ set_device_position:
           step: 0.1
           unit_of_measurement: m
     y:
-      name: Y-Position (Meter)
       required: true
       selector:
         number:
@@ -52,63 +32,64 @@ set_device_position:
           step: 0.1
           unit_of_measurement: m
     z:
-      name: Höhe Z (Meter)
-      description: Montagehöhe (Steckdose ~0.3m, Tisch ~0.8m, Deckenlampe ~2.4m).
       default: 1.0
       selector:
         number:
           min: 0
           max: 10
-          step: 0.1
+          step: 0.05
           unit_of_measurement: m
 
 define_room:
-  name: Raumzone definieren
-  description: >-
-    Definiert oder aktualisiert einen rechteckigen Raum auf dem Grundriss für
-    raumbezogene Präsenz-Sensoren.
   fields:
     room_id:
-      name: Raum-ID
-      description: Eindeutige ID ohne Leerzeichen (z. B. wohnzimmer).
       required: true
       selector:
         text:
     name:
-      name: Raumname
-      description: Anzeigename (z. B. Wohnzimmer).
       required: true
       selector:
         text:
     x_min:
-      name: X Min (m)
-      required: true
+      default: 0
       selector:
         number:
           min: 0
           max: 100
           step: 0.1
+          unit_of_measurement: m
     y_min:
-      name: Y Min (m)
-      required: true
+      default: 0
       selector:
         number:
           min: 0
           max: 100
           step: 0.1
+          unit_of_measurement: m
     x_max:
-      name: X Max (m)
-      required: true
+      default: 5
       selector:
         number:
           min: 0
           max: 100
           step: 0.1
+          unit_of_measurement: m
     y_max:
-      name: Y Max (m)
-      required: true
+      default: 4
       selector:
         number:
           min: 0
           max: 100
           step: 0.1
+          unit_of_measurement: m
+    polygon:
+      required: false
+      selector:
+        object:
+
+delete_room:
+  fields:
+    room_id:
+      required: true
+      selector:
+        text:

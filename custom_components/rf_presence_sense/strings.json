@@ -33,13 +33,172 @@
   "options": {
     "step": {
       "init": {
-        "title": "RF Presence Sense — Tuning",
+        "title": "RF Presence Sense — Settings",
+        "description": "Manage tuning, stationary devices, 3D device positions, or rooms. Changes to positions and rooms are persisted automatically.",
+        "menu_options": {
+          "tuning": "Tuning, Floorplan & Baseline",
+          "devices": "Manage Stationary Wi-Fi & BLE Devices",
+          "positions": "Edit 3D Device & Receiver Positions",
+          "rooms": "Manage Rooms (Add / Edit / Delete)"
+        }
+      },
+      "tuning": {
+        "title": "Tuning, Floorplan & Presence-Aware Baseline",
         "data": {
           "sensitivity": "Detection sensitivity",
           "update_interval": "Reconstruction interval (s)",
+          "floor_width": "Floorplan width (m)",
+          "floor_height": "Floorplan height (m)",
+          "grid_resolution": "RTI grid resolution (m)",
           "enable_wifi_entities": "Use existing Wi-Fi/RF RSSI entities",
-          "enable_ble": "Use native Home Assistant Bluetooth (passive)"
+          "enable_ble": "Use native Home Assistant Bluetooth (passive)",
+          "active_poll_entities": "Active polling entities (for slow Wi-Fi RSSI sensors)",
+          "presence_aware_baseline": "Presence-aware baseline (freeze drift when occupied)",
+          "away_entity": "Optional away/presence entity (e.g. zone.home or input_boolean)"
         }
+      },
+      "devices": {
+        "title": "Manage Stationary Wi-Fi & Bluetooth Devices",
+        "description": "Found {wifi_count} Wi-Fi/RF entities and {ble_count} Bluetooth devices (max {max_links} active links). Existing 3D coordinates are preserved.",
+        "data": {
+          "wifi_entities": "Stationary Wi-Fi / RF RSSI Entities",
+          "ble_devices": "Stationary Bluetooth Devices"
+        }
+      },
+      "positions": {
+        "title": "Select Device or Receiver",
+        "description": "Choose a stationary device or receiver ([RX]) to adjust its 3D coordinates (x, y, z).",
+        "data": {
+          "target_id": "Device or Receiver"
+        }
+      },
+      "position_edit": {
+        "title": "Edit 3D Position — {device_name}",
+        "description": "Set exact 3D coordinates in meters. Height Z (e.g. plug 0.35m vs. lamp 1.8m) improves human vs. animal discrimination.",
+        "data": {
+          "x": "X Position (m)",
+          "y": "Y Position (m)",
+          "z": "Height Z (m)"
+        }
+      },
+      "rooms": {
+        "title": "Manage Rooms ({room_count} configured)",
+        "description": "Enter Room ID and Name to create or update a room, or choose an existing room below to delete it. Room presence sensors update automatically.",
+        "data": {
+          "room_id": "Room ID (e.g. living_room)",
+          "name": "Display Name (e.g. Living Room)",
+          "x_min": "X Min (m)",
+          "y_min": "Y Min (m)",
+          "x_max": "X Max (m)",
+          "y_max": "Y Max (m)",
+          "delete_room_id": "Delete existing room (optional)"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "humans_count": {
+        "name": "Detected Humans"
+      },
+      "animals_count": {
+        "name": "Detected Animals"
+      },
+      "total_targets": {
+        "name": "Detected Living Beings Total"
+      },
+      "targets_detail": {
+        "name": "Positions & Targets"
+      },
+      "link_health": {
+        "name": "RF Network Coverage"
+      }
+    },
+    "binary_sensor": {
+      "human_detected": {
+        "name": "Human Detected"
+      },
+      "animal_detected": {
+        "name": "Animal Detected"
+      },
+      "room_occupied": {
+        "name": "{room} Presence"
+      },
+      "room_human": {
+        "name": "{room} Human"
+      },
+      "room_animal": {
+        "name": "{room} Animal"
+      }
+    },
+    "camera": {
+      "live_3d_map": {
+        "name": "3D Live RF Map"
+      }
+    },
+    "button": {
+      "calibrate_empty_room": {
+        "name": "Calibrate Empty Room"
+      },
+      "reset_baseline": {
+        "name": "Reset Baseline"
+      }
+    },
+    "number": {
+      "sensitivity": {
+        "name": "Detection Sensitivity"
+      },
+      "calibration_duration": {
+        "name": "Calibration Duration"
+      }
+    }
+  },
+  "services": {
+    "calibrate_empty_room": {
+      "name": "Calibrate empty room",
+      "description": "Records undisturbed RSSI baseline and noise floor for all Wi-Fi and Bluetooth links and persists them across restarts.",
+      "fields": {
+        "duration_seconds": {
+          "name": "Duration (seconds)",
+          "description": "Calibration duration between 5 and 120 seconds."
+        }
+      }
+    },
+    "reset_baseline": {
+      "name": "Reset baseline",
+      "description": "Immediately resets adaptive RSSI baselines to current readings and persists them."
+    },
+    "set_device_position": {
+      "name": "Set 3D device position",
+      "description": "Sets and persists exact 3D (x, y, z) coordinates in meters for a stationary device or receiver.",
+      "fields": {
+        "device_id": {
+          "name": "Device or Receiver ID",
+          "description": "Entity ID, BLE MAC address, or receiver ID (e.g. router_main)."
+        },
+        "x": { "name": "X Position (m)" },
+        "y": { "name": "Y Position (m)" },
+        "z": { "name": "Height Z (m)", "description": "Mounting height (plug ~0.35m, table ~0.8m, ceiling lamp ~2.4m)." }
+      }
+    },
+    "define_room": {
+      "name": "Define room zone",
+      "description": "Creates or updates a rectangular or polygon room zone, persists it, and dynamically adds its room presence binary sensors.",
+      "fields": {
+        "room_id": { "name": "Room ID", "description": "Unique identifier without spaces (e.g. living_room)." },
+        "name": { "name": "Room Name", "description": "Display name (e.g. Living Room)." },
+        "x_min": { "name": "X Min (m)" },
+        "y_min": { "name": "Y Min (m)" },
+        "x_max": { "name": "X Max (m)" },
+        "y_max": { "name": "Y Max (m)" },
+        "polygon": { "name": "Polygon Vertices (optional)", "description": "Optional list of [x, y] coordinate pairs for L-shaped or custom rooms." }
+      }
+    },
+    "delete_room": {
+      "name": "Delete room zone",
+      "description": "Removes a configured room zone from persistent storage.",
+      "fields": {
+        "room_id": { "name": "Room ID", "description": "ID of the room to delete." }
       }
     }
   }

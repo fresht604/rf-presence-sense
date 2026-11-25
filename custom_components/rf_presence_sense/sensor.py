@@ -28,21 +28,21 @@ async def async_setup_entry(
             coordinator,
             entry,
             key="humans_count",
-            name="Erkannte Menschen",
+            translation_key="humans_count",
             icon="mdi:account-multiple",
         ),
         RFCountSensor(
             coordinator,
             entry,
             key="animals_count",
-            name="Erkannte Tiere",
+            translation_key="animals_count",
             icon="mdi:paw",
         ),
         RFCountSensor(
             coordinator,
             entry,
             key="total_targets",
-            name="Erkannte Lebewesen Gesamt",
+            translation_key="total_targets",
             icon="mdi:radar",
         ),
         RFTargetsDetailSensor(coordinator, entry),
@@ -56,7 +56,7 @@ def _device_info(entry: ConfigEntry) -> DeviceInfo:
         identifiers={(DOMAIN, entry.entry_id)},
         name=NAME,
         manufacturer="RF Presence Sense",
-        model="Radio Tomographic Imaging (Wi-Fi + BLE)",
+        model="Radio Tomographic Imaging (Wi-Fi + BLE 3D)",
         sw_version=VERSION,
     )
 
@@ -72,13 +72,13 @@ class RFCountSensor(CoordinatorEntity[RFPresenceCoordinator], SensorEntity):
         coordinator: RFPresenceCoordinator,
         entry: ConfigEntry,
         key: str,
-        name: str,
+        translation_key: str,
         icon: str,
     ) -> None:
         super().__init__(coordinator)
         self._key = key
         self._attr_unique_id = f"{entry.entry_id}_{key}"
-        self._attr_name = name
+        self._attr_translation_key = translation_key
         self._attr_icon = icon
         self._attr_device_info = _device_info(entry)
 
@@ -90,12 +90,28 @@ class RFCountSensor(CoordinatorEntity[RFPresenceCoordinator], SensorEntity):
 
 
 class RFTargetsDetailSensor(CoordinatorEntity[RFPresenceCoordinator], SensorEntity):
-    """Sensor exposing full target coordinates, velocities, rooms, and classifications."""
+    """Sensor exposing full 3D target coordinates, rooms, links, and heatmap data."""
 
     _attr_has_entity_name = True
-    _attr_name = "Positionen & Ziele"
+    _attr_translation_key = "targets_detail"
     _attr_icon = "mdi:crosshairs-gps"
-    _unrecorded_attributes = frozenset({"targets", "rooms", "geometry", "calibrating"})
+    # Exclude ALL volatile & 3D scene attributes from HA Recorder DB!
+    _unrecorded_attributes = frozenset(
+        {
+            "targets",
+            "rooms",
+            "rooms_geometry",
+            "geometry",
+            "calibrating",
+            "devices",
+            "receivers",
+            "active_links_3d",
+            "heatmap_peaks",
+            "sensitivity",
+            "calibration_duration",
+            "presence_aware_baseline",
+        }
+    )
 
     def __init__(
         self, coordinator: RFPresenceCoordinator, entry: ConfigEntry
@@ -108,26 +124,45 @@ class RFTargetsDetailSensor(CoordinatorEntity[RFPresenceCoordinator], SensorEnti
     def native_value(self) -> str:
         data = self.coordinator.data or {}
         if data.get("calibrating"):
-            return "Kalibrierung läuft"
+            return "calibrating"
         humans = data.get("humans_count", 0)
         animals = data.get("animals_count", 0)
         if humans == 0 and animals == 0:
-            return "Frei"
+            return "clear"
         parts = []
         if humans:
-            parts.append(f"{humans} Mensch(en)")
+            parts.append(f"{humans}H")
         if animals:
-            parts.append(f"{animals} Tier(e)")
-        return ", ".join(parts)
+            parts.append(f"{animals}A")
+        return " ".join(parts)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         data = self.coordinator.data or {}
+        # Omit nested duplicate 'targets' inside rooms (already exposed at top level)
+        raw_rooms = data.get("rooms", {})
+        compact_rooms = {
+            rid: {k: v for k, v in rdata.items() if k != "targets"}
+            for rid, rdata in raw_rooms.items()
+            if isinstance(rdata, dict)
+        }
         return {
             "targets": data.get("targets", []),
-            "rooms": data.get("rooms", {}),
+            "rooms": compact_rooms,
+            "rooms_geometry": data.get("rooms_geometry", []),
             "calibrating": data.get("calibrating", False),
             "geometry": data.get("geometry", {}),
+            "devices": data.get("devices", []),
+            "receivers": data.get("receivers", []),
+            "active_links_3d": data.get("active_links_3d", []),
+            "heatmap_peaks": data.get("heatmap_peaks", []),
+            "sensitivity": data.get("sensitivity", self.coordinator.sensitivity),
+            "calibration_duration": data.get(
+                "calibration_duration", self.coordinator.calibration_duration
+            ),
+            "presence_aware_baseline": data.get(
+                "presence_aware_baseline", self.coordinator.presence_aware_baseline
+            ),
         }
 
 
@@ -135,7 +170,7 @@ class RFLinkHealthSensor(CoordinatorEntity[RFPresenceCoordinator], SensorEntity)
     """Sensor reporting active RF link coverage and ingested packet count."""
 
     _attr_has_entity_name = True
-    _attr_name = "RF-Netz Abdeckung"
+    _attr_translation_key = "link_health"
     _attr_icon = "mdi:wifi-check"
     _attr_native_unit_of_measurement = "%"
     _attr_state_class = SensorStateClass.MEASUREMENT

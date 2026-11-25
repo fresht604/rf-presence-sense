@@ -33,13 +33,172 @@
   "options": {
     "step": {
       "init": {
-        "title": "RF Presence Sense — Feintuning",
+        "title": "RF Presence Sense — Einstellungen",
+        "description": "Verwalte Feintuning, stationäre Geräte, 3D-Positionen und Räume. Positionen, Räume und Kalibrierungen werden dauerhaft gespeichert.",
+        "menu_options": {
+          "tuning": "Feintuning, Grundriss & Baseline",
+          "devices": "Stationäre WLAN- & BLE-Geräte verwalten",
+          "positions": "3D-Positionen von Geräten & Empfängern bearbeiten",
+          "rooms": "Räume verwalten (Anlegen / Ändern / Löschen)"
+        }
+      },
+      "tuning": {
+        "title": "Feintuning, Grundriss & Präsenz-Baseline",
         "data": {
           "sensitivity": "Empfindlichkeit",
           "update_interval": "Aktualisierungsintervall (s)",
+          "floor_width": "Grundriss Breite (m)",
+          "floor_height": "Grundriss Tiefe (m)",
+          "grid_resolution": "RTI-Rasterauflösung (m)",
           "enable_wifi_entities": "Bestehende WLAN/RF RSSI-Entitäten nutzen",
-          "enable_ble": "Natives Home Assistant Bluetooth (passiv) nutzen"
+          "enable_ble": "Natives Home Assistant Bluetooth (passiv) nutzen",
+          "active_poll_entities": "Aktive Abfrage-Entitäten (für langsame WLAN-RSSI-Sensoren)",
+          "presence_aware_baseline": "Präsenz-bewusste Baseline (kein Drift bei Anwesenheit)",
+          "away_entity": "Optionale Abwesenheits-/Präsenz-Entität (z. B. zone.home)"
         }
+      },
+      "devices": {
+        "title": "Stationäre WLAN- & Bluetooth-Geräte verwalten",
+        "description": "{wifi_count} WLAN/RF-Entitäten und {ble_count} Bluetooth-Geräte gefunden (max. {max_links} aktive Links). Vorhandene 3D-Positionen bleiben erhalten.",
+        "data": {
+          "wifi_entities": "Stationäre WLAN- / RF-RSSI-Entitäten",
+          "ble_devices": "Stationäre Bluetooth-Geräte"
+        }
+      },
+      "positions": {
+        "title": "Gerät oder Empfänger auswählen",
+        "description": "Wähle ein stationäres Gerät oder einen Empfänger ([RX]) aus, um seine 3D-Koordinaten (x, y, z) festzulegen.",
+        "data": {
+          "target_id": "Gerät oder Empfänger"
+        }
+      },
+      "position_edit": {
+        "title": "3D-Position bearbeiten — {device_name}",
+        "description": "Gib die exakten 3D-Koordinaten in Metern an. Die Höhe Z (z. B. Steckdose 0,35 m vs. Lampe 1,8 m) verbessert die Mensch/Tier-Unterscheidung.",
+        "data": {
+          "x": "X-Position (m)",
+          "y": "Y-Position (m)",
+          "z": "Höhe Z (m)"
+        }
+      },
+      "rooms": {
+        "title": "Räume verwalten ({room_count} konfiguriert)",
+        "description": "Gib Raum-ID und Name ein, um einen Raum anzulegen oder zu ändern, oder wähle unten einen Raum zum Löschen. Raum-Präsenz-Sensoren werden sofort aktualisiert.",
+        "data": {
+          "room_id": "Raum-ID (z. B. wohnzimmer)",
+          "name": "Anzeigename (z. B. Wohnzimmer)",
+          "x_min": "X Min (m)",
+          "y_min": "Y Min (m)",
+          "x_max": "X Max (m)",
+          "y_max": "Y Max (m)",
+          "delete_room_id": "Vorhandenen Raum löschen (optional)"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "humans_count": {
+        "name": "Erkannte Menschen"
+      },
+      "animals_count": {
+        "name": "Erkannte Tiere"
+      },
+      "total_targets": {
+        "name": "Erkannte Lebewesen Gesamt"
+      },
+      "targets_detail": {
+        "name": "Positionen & Ziele"
+      },
+      "link_health": {
+        "name": "RF-Netz Abdeckung"
+      }
+    },
+    "binary_sensor": {
+      "human_detected": {
+        "name": "Mensch erkannt"
+      },
+      "animal_detected": {
+        "name": "Tier erkannt"
+      },
+      "room_occupied": {
+        "name": "{room} Präsenz"
+      },
+      "room_human": {
+        "name": "{room} Mensch"
+      },
+      "room_animal": {
+        "name": "{room} Tier"
+      }
+    },
+    "camera": {
+      "live_3d_map": {
+        "name": "3D Live RF-Map"
+      }
+    },
+    "button": {
+      "calibrate_empty_room": {
+        "name": "Leeren Raum kalibrieren"
+      },
+      "reset_baseline": {
+        "name": "Baseline zurücksetzen"
+      }
+    },
+    "number": {
+      "sensitivity": {
+        "name": "Empfindlichkeit"
+      },
+      "calibration_duration": {
+        "name": "Kalibrierdauer"
+      }
+    }
+  },
+  "services": {
+    "calibrate_empty_room": {
+      "name": "Leeren Raum kalibrieren",
+      "description": "Misst die ungestörte RSSI-Baseline und das Grundrauschen aller WLAN- und Bluetooth-Links und speichert sie dauerhaft.",
+      "fields": {
+        "duration_seconds": {
+          "name": "Dauer (Sekunden)",
+          "description": "Messdauer für die Baseline-Kalibrierung (5 bis 120 Sekunden)."
+        }
+      }
+    },
+    "reset_baseline": {
+      "name": "Baseline zurücksetzen",
+      "description": "Setzt die adaptive RSSI-Baseline aller Links sofort auf die aktuellen Messwerte zurück und speichert sie."
+    },
+    "set_device_position": {
+      "name": "Geräteposition (3D) festlegen",
+      "description": "Legt die exakte (x, y, z) Position in Metern dauerhaft für ein Gerät oder einen Empfänger fest.",
+      "fields": {
+        "device_id": {
+          "name": "Geräte- oder Empfänger-ID",
+          "description": "Entity-ID, BLE-MAC oder Empfänger-ID (z. B. router_main)."
+        },
+        "x": { "name": "X-Position (m)" },
+        "y": { "name": "Y-Position (m)" },
+        "z": { "name": "Höhe Z (m)", "description": "Montagehöhe (Steckdose ~0,35 m, Tisch ~0,8 m, Deckenlampe ~2,4 m)." }
+      }
+    },
+    "define_room": {
+      "name": "Raumzone definieren",
+      "description": "Definiert oder aktualisiert einen rechteckigen oder Polygon-Raum, speichert ihn dauerhaft und legt sofort Raum-Präsenz-Sensoren an.",
+      "fields": {
+        "room_id": { "name": "Raum-ID", "description": "Eindeutige ID ohne Leerzeichen (z. B. wohnzimmer)." },
+        "name": { "name": "Raumname", "description": "Anzeigename (z. B. Wohnzimmer)." },
+        "x_min": { "name": "X Min (m)" },
+        "y_min": { "name": "Y Min (m)" },
+        "x_max": { "name": "X Max (m)" },
+        "y_max": { "name": "Y Max (m)" },
+        "polygon": { "name": "Polygon-Eckpunkte (optional)", "description": "Optionale Liste von [x, y]-Paaren für L-förmige oder freie Räume." }
+      }
+    },
+    "delete_room": {
+      "name": "Raumzone löschen",
+      "description": "Entfernt eine konfigurierte Raumzone dauerhaft.",
+      "fields": {
+        "room_id": { "name": "Raum-ID", "description": "ID des zu löschenden Raums." }
       }
     }
   }

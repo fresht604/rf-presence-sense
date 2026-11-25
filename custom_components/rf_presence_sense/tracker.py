@@ -1,13 +1,15 @@
 """Multi-target 2D Kalman Tracker and 3D Human/Animal Classifier.
 
 Extracts sub-voxel peaks from the RTI attenuation image, tracks multiple moving
-or stationary targets with a 2D Constant-Velocity Kalman Filter, classifies each
-target as 'human' or 'animal' using 3D vertical link energy & RF cross-section
-heuristics, and assigns targets to configured rooms.
+or stationary targets with a 2D Constant-Velocity Kalman Filter (plus bounded
+movement trails), classifies each target as 'human' or 'animal' using voxel-exact
+3D vertical link energy & RF cross-section heuristics, and assigns targets to
+rectangular or arbitrary polygon rooms.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 import math
 from typing import Any
@@ -22,6 +24,7 @@ from .const import (
     TRACKER_MAX_MISSED,
     TRACKER_MAX_TRACKS,
     TRACKER_MIN_HITS,
+    TRACKER_TRAIL_MAXLEN,
 )
 from .rti_engine import RTIReconstruction
 
@@ -34,9 +37,37 @@ def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-clamped))
 
 
+def _point_in_polygon(x: float, y: float, polygon: list[tuple[float, float]]) -> bool:
+    """Standard ray-casting point-in-polygon check with boundary inclusion."""
+    n = len(polygon)
+    if n < 3:
+        return False
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        # Check if point lies directly on segment (xj, yj) -> (xi, yi)
+        dx = xi - xj
+        dy = yi - yj
+        cross = (x - xj) * dy - (y - yj) * dx
+        if abs(cross) <= 1e-6:
+            if (
+                min(xi, xj) - 1e-6 <= x <= max(xi, xj) + 1e-6
+                and min(yi, yj) - 1e-6 <= y <= max(yi, yj) + 1e-6
+            ):
+                return True
+        if (yi > y) != (yj > y):
+            x_intersect = (xj - xi) * (y - yi) / (yj - yi) + xi
+            if x < x_intersect:
+                inside = not inside
+        j = i
+    return inside
+
+
 @dataclass
 class RoomZone:
-    """Axis-aligned rectangular room zone in floorplan coordinates (meters)."""
+    """Rectangular or arbitrary polygon room zone in floorplan coordinates (meters)."""
 
     room_id: str
     name: str
@@ -44,10 +75,47 @@ class RoomZone:
     y_min: float
     x_max: float
     y_max: float
+    polygon: list[tuple[float, float]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.polygon is not None and len(self.polygon) >= 3:
+            self.polygon = [(float(pt[0]), float(pt[1])) for pt in self.polygon]
+            xs = [pt[0] for pt in self.polygon]
+            ys = [pt[1] for pt in self.polygon]
+            self.x_min = min(xs)
+            self.x_max = max(xs)
+            self.y_min = min(ys)
+            self.y_max = max(ys)
+        else:
+            self.polygon = None
+            x1, x2 = float(self.x_min), float(self.x_max)
+            y1, y2 = float(self.y_min), float(self.y_max)
+            self.x_min = min(x1, x2)
+            self.x_max = max(x1, x2)
+            self.y_min = min(y1, y2)
+            self.y_max = max(y1, y2)
 
     def contains(self, x: float, y: float) -> bool:
-        """Return True if point (x, y) lies inside this room."""
-        return self.x_min <= x <= self.x_max and self.y_min <= y <= self.y_max
+        """Return True if point (x, y) lies inside this rectangular or polygon room."""
+        if not (self.x_min <= x <= self.x_max and self.y_min <= y <= self.y_max):
+            return False
+        if self.polygon is not None:
+            return _point_in_polygon(x, y, self.polygon)
+        return True
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize room definition for persistent storage and 3D Lovelace Card."""
+        data: dict[str, Any] = {
+            "id": self.room_id,
+            "name": self.name,
+            "x_min": round(self.x_min, 2),
+            "y_min": round(self.y_min, 2),
+            "x_max": round(self.x_max, 2),
+            "y_max": round(self.y_max, 2),
+        }
+        if self.polygon is not None:
+            data["polygon"] = [[round(px, 2), round(py, 2)] for px, py in self.polygon]
+        return data
 
 
 @dataclass
@@ -85,6 +153,13 @@ class TrackedTarget:
     room_name: str | None = None
     last_low_energy: float = 0.0
     last_high_energy: float = 0.0
+    trail: deque[tuple[float, float]] = field(
+        default_factory=lambda: deque(maxlen=TRACKER_TRAIL_MAXLEN)
+    )
+
+    def __post_init__(self) -> None:
+        if not self.trail:
+            self.trail.append((self.x, self.y))
 
     @property
     def target_type(self) -> str:
@@ -111,6 +186,7 @@ class TrackedTarget:
             "human_probability": round(self.human_score, 2),
             "room_id": self.room_id,
             "room": self.room_name or "Unbekannt",
+            "trail": [[round(px, 2), round(py, 2)] for px, py in self.trail],
         }
 
 
@@ -355,6 +431,7 @@ class MultiTargetTracker:
             track.hits += 1
             track.missed = 0
             track.room_id, track.room_name = self._find_room(track.x, track.y)
+            track.trail.append((track.x, track.y))
 
         # 3. Age unmatched tracks
         to_delete: list[int] = []

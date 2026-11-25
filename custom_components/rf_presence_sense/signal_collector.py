@@ -4,13 +4,14 @@ Requires NO extra ESP32 or Bluetooth Proxy hardware. Taps into:
   1. Existing HA RSSI / signal_strength / linkquality sensor entities (Shelly,
      Tasmota, ESPHome, UniFi, Fritz!Box, TP-Link, Meross, Zigbee2MQTT, ZHA, etc.)
   2. Existing HA device_tracker entities exposing 'rssi' / 'signal_strength' attrs
+     (with dynamic Multi-AP tracking via ap_mac / bssid / router attributes)
   3. Native HA Bluetooth stack (homeassistant.components.bluetooth) passive
      advertisements from stationary BLE devices already in range.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 import logging
 import time
 from typing import Any
@@ -98,6 +99,20 @@ def _parse_float(value: Any) -> float | None:
     return val
 
 
+def extract_receiver_from_state(state: State | None, fallback: str = "router_main") -> str:
+    """Dynamically resolve AP / router receiver ID from live entity attributes."""
+    if state is None:
+        return fallback
+    attrs = state.attributes
+    for key in ("ap_mac", "bssid", "router"):
+        val = attrs.get(key)
+        if val is not None:
+            sval = str(val).strip()
+            if sval:
+                return sval
+    return fallback
+
+
 def extract_rssi_from_state(state: State | None) -> tuple[float | None, str]:
     """Extract an RSSI value (in dBm) and protocol hint from a HA State object.
 
@@ -116,7 +131,11 @@ def extract_rssi_from_state(state: State | None) -> tuple[float | None, str]:
     if dev_class == "signal_strength" or unit == "dbm":
         val = _parse_float(state.state)
         if val is not None and -120.0 <= val <= 0.0:
-            proto = PROTOCOL_BLE if "ble" in entity_id_lower or "bluetooth" in entity_id_lower else PROTOCOL_WIFI
+            proto = (
+                PROTOCOL_BLE
+                if "ble" in entity_id_lower or "bluetooth" in entity_id_lower
+                else PROTOCOL_WIFI
+            )
             return (val, proto)
 
     # 2. Zigbee/Thread LQI (0..255) -> pseudo-dBm
@@ -150,6 +169,40 @@ def extract_rssi_from_state(state: State | None) -> tuple[float | None, str]:
     return (None, PROTOCOL_WIFI)
 
 
+def discover_entity_areas(
+    hass: HomeAssistant, entity_ids: Iterable[str]
+) -> dict[str, str]:
+    """Map Home Assistant entity_ids to their assigned HA Area name (if any)."""
+    areas: dict[str, str] = {}
+    try:
+        from homeassistant.helpers import (  # pylint: disable=import-outside-toplevel
+            area_registry as ar,
+            device_registry as dr,
+            entity_registry as er,
+        )
+
+        ent_reg = er.async_get(hass)
+        dev_reg = dr.async_get(hass)
+        area_reg = ar.async_get(hass)
+
+        for eid in entity_ids:
+            ent_entry = ent_reg.async_get(eid)
+            if ent_entry is None:
+                continue
+            area_id = ent_entry.area_id
+            if not area_id and ent_entry.device_id:
+                dev_entry = dev_reg.async_get(ent_entry.device_id)
+                if dev_entry is not None:
+                    area_id = dev_entry.area_id
+            if area_id:
+                area_entry = area_reg.async_get_area(area_id)
+                if area_entry is not None and area_entry.name:
+                    areas[eid] = str(area_entry.name)
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.debug("HA area lookup unavailable: %s", err)
+    return areas
+
+
 def discover_rssi_entities(hass: HomeAssistant) -> dict[str, dict[str, Any]]:
     """Scan all current HA states for entities providing Wi-Fi/RF RSSI."""
     discovered: dict[str, dict[str, Any]] = {}
@@ -157,19 +210,16 @@ def discover_rssi_entities(hass: HomeAssistant) -> dict[str, dict[str, Any]]:
         rssi, proto = extract_rssi_from_state(state)
         if rssi is not None:
             friendly = state.attributes.get("friendly_name", state.entity_id)
-            # Detect AP / receiver hint from UniFi/Fritz/OpenWrt attributes
-            receiver_hint = (
-                state.attributes.get("ap_mac")
-                or state.attributes.get("essid")
-                or state.attributes.get("router")
-                or "router_main"
+            receiver_hint = extract_receiver_from_state(
+                state,
+                fallback=str(state.attributes.get("essid") or "router_main"),
             )
             discovered[state.entity_id] = {
                 "entity_id": state.entity_id,
                 "name": str(friendly),
                 "rssi": rssi,
                 "protocol": proto,
-                "receiver_id": str(receiver_hint),
+                "receiver_id": receiver_hint,
             }
     return discovered
 
@@ -222,7 +272,7 @@ class SignalCollector:
         self._enable_wifi_entities = enable_wifi_entities
         self._ble_min_interval = max(0.0, float(ble_min_interval))
 
-        self._tracked_entities: dict[str, str] = {}  # entity_id -> receiver_id
+        self._tracked_entities: dict[str, str] = {}  # entity_id -> default receiver_id
         self._tracked_ble_macs: set[str] = set()  # uppercase MACs
         self._last_ble_ts: dict[tuple[str, str], float] = {}
         self._unsub_state: Callable[[], None] | None = None
@@ -268,10 +318,11 @@ class SignalCollector:
             )
             # Seed initial values immediately
             now = time.monotonic()
-            for eid, recv_id in self._tracked_entities.items():
+            for eid, default_recv_id in self._tracked_entities.items():
                 state = self.hass.states.get(eid)
                 rssi, proto = extract_rssi_from_state(state)
                 if rssi is not None:
+                    recv_id = extract_receiver_from_state(state, fallback=default_recv_id)
                     self._packet_count += 1
                     self._on_sample(eid, recv_id, rssi, proto, now)
 
@@ -330,14 +381,15 @@ class SignalCollector:
 
     @callback
     def _handle_state_event(self, event: Event) -> None:
-        """Handle real-time state change on a tracked Wi-Fi/RF RSSI entity."""
+        """Handle real-time state change on a tracked Wi-Fi/RF RSSI entity (with Multi-AP)."""
         new_state: State | None = event.data.get("new_state")
         if new_state is None:
             return
         rssi, proto = extract_rssi_from_state(new_state)
         if rssi is None:
             return
-        recv_id = self._tracked_entities.get(new_state.entity_id, "router_main")
+        default_recv = self._tracked_entities.get(new_state.entity_id, "router_main")
+        recv_id = extract_receiver_from_state(new_state, fallback=default_recv)
         self._packet_count += 1
         self._on_sample(
             new_state.entity_id,

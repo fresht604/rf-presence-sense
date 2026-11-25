@@ -1,15 +1,15 @@
 """Pure-Python Radio Tomographic Imaging (RTI + VRTI) Engine.
 
-Implements device-free passive localization using existing Wi-Fi & Bluetooth RSSI
+Implements device-free passive 3D localization using existing Wi-Fi & Bluetooth RSSI
 links via:
   1. Smooth Fresnel-zone elliptical link weighting (Wilson & Patwari, IEEE TMC 2010)
   2. Dual-mode Shadowing + Variance-Based RTI (VRTI, IEEE TMC 2011)
   3. Woodbury dual-form Tikhonov-regularized inversion (O(M^3) in pure Python,
      zero external dependencies) with on-the-fly sparse covariance projection
      (eliminating permanent O(N^2) RAM matrices)
-  4. Adaptive dual-filter baseline tracking with empty-room calibration
-  5. 3D vertical layer energy attribution (low-height vs. high-height links) for
-     human vs. animal discrimination.
+  4. Presence-aware adaptive baseline tracking with empty-room calibration & persistence
+  5. Voxel-accurate 3D vertical height interpolation z(x, y) along every link for
+     precise human vs. animal discrimination.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ from .const import (
     MAX_CALIBRATION_SAMPLES,
     MAX_LINKS,
     MAX_VOXELS,
+    PROTOCOL_STALE_SECONDS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -89,12 +90,29 @@ class RFLink:
         """True if the link primarily traverses pet/lower-body altitude."""
         return self.mean_height < LOW_HEIGHT_THRESHOLD_M
 
+    @property
+    def stale_seconds(self) -> float:
+        """Protocol-appropriate silence timeout before a link is considered stale."""
+        return PROTOCOL_STALE_SECONDS.get(self.protocol, DEFAULT_LINK_STALE_SECONDS)
+
+    def height_at(self, vx: float, vy: float) -> float:
+        """Interpolate exact 3D link height z(x, y) at closest point on segment p1->p2."""
+        dx = self.p2.x - self.p1.x
+        dy = self.p2.y - self.p1.y
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq <= 1e-9:
+            return self.mean_height
+        t = ((vx - self.p1.x) * dx + (vy - self.p1.y) * dy) / seg_len_sq
+        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        return self.p1.z + t * (self.p2.z - self.p1.z)
+
     def add_sample(
         self,
         rssi: float,
         now: float | None = None,
         calibrating: bool = False,
         window_seconds: float = DEFAULT_WINDOW_SECONDS,
+        freeze_baseline: bool = False,
     ) -> None:
         """Ingest a new RSSI reading (in dBm)."""
         ts = time.monotonic() if now is None else now
@@ -114,6 +132,10 @@ class RFLink:
 
         if self.baseline_rssi is None:
             self.baseline_rssi = val
+            return
+
+        # Presence-aware baseline: skip drift when targets/presence freeze adaptation
+        if freeze_baseline:
             return
 
         # Adaptive baseline: only drift slowly when link appears quiet
@@ -147,7 +169,7 @@ class RFLink:
     def compute_perturbation(
         self,
         now: float | None = None,
-        stale_seconds: float = DEFAULT_LINK_STALE_SECONDS,
+        stale_seconds: float | None = None,
         variance_weight: float = DEFAULT_VARIANCE_WEIGHT,
         constructive_weight: float = DEFAULT_CONSTRUCTIVE_WEIGHT,
     ) -> tuple[float, float, float]:
@@ -157,10 +179,11 @@ class RFLink:
             (total_perturbation, shadowing_db, excess_std_db)
         """
         ts = time.monotonic() if now is None else now
+        timeout = self.stale_seconds if stale_seconds is None else stale_seconds
         if (
             self.baseline_rssi is None
             or self.last_rssi is None
-            or (ts - self.last_updated) > stale_seconds
+            or (ts - self.last_updated) > timeout
         ):
             return (0.0, 0.0, 0.0)
 
@@ -254,7 +277,7 @@ def _cholesky_invert(matrix: list[list[float]]) -> list[list[float]]:
 
 
 class RTIEngine:
-    """2D Radio Tomographic Imaging engine with 3D vertical layer attribution."""
+    """2D Radio Tomographic Imaging engine with voxel-accurate 3D height attribution."""
 
     def __init__(
         self,
@@ -319,7 +342,8 @@ class RTIEngine:
         # Links and precomputed projection matrix Pi (N x M)
         self.links: dict[str, RFLink] = {}
         self._link_order: list[str] = []
-        self._sparse_weights: list[list[tuple[int, float]]] = []  # M sparse rows
+        # M sparse rows of (voxel_idx, weight, is_low_voxel)
+        self._sparse_weights: list[list[tuple[int, float, bool]]] = []
         self._projection_matrix: list[list[float]] = []  # N x M
         self._low_coverage: list[list[float]] = [
             [0.0] * self.cols for _ in range(self.rows)
@@ -347,8 +371,9 @@ class RTIEngine:
 
             if existing is not None:
                 link.samples = existing.samples
-                link.baseline_rssi = existing.baseline_rssi
-                link.baseline_std = existing.baseline_std
+                if link.baseline_rssi is None:
+                    link.baseline_rssi = existing.baseline_rssi
+                    link.baseline_std = existing.baseline_std
                 link.last_rssi = existing.last_rssi
                 link.last_updated = existing.last_updated
                 link.calibration_samples = existing.calibration_samples
@@ -367,19 +392,37 @@ class RTIEngine:
                 if len(self.links) < MAX_LINKS:
                     self._max_links_warned = False
 
+    def clear_links_except(self, valid_link_ids: set[str]) -> None:
+        """Remove links that are no longer in the configured device set."""
+        with self._lock:
+            stale = [lid for lid in self.links if lid not in valid_link_ids]
+            for lid in stale:
+                del self.links[lid]
+            if stale:
+                self._dirty_geometry = True
+                self._geometry_version += 1
+                if len(self.links) < MAX_LINKS:
+                    self._max_links_warned = False
+
     def ingest_sample(
         self,
         link_id: str,
         rssi: float,
         now: float | None = None,
         calibrating: bool = False,
+        freeze_baseline: bool = False,
     ) -> bool:
         """Thread-safely ingest a live RSSI sample into an existing link."""
         with self._lock:
             link = self.links.get(link_id)
             if link is None:
                 return False
-            link.add_sample(rssi, now=now, calibrating=calibrating)
+            link.add_sample(
+                rssi,
+                now=now,
+                calibrating=calibrating,
+                freeze_baseline=freeze_baseline,
+            )
             return True
 
     def clear_calibration_samples(self) -> None:
@@ -400,8 +443,37 @@ class RTIEngine:
             for link in self.links.values():
                 link.reset_baseline()
 
+    def export_baselines(self) -> dict[str, dict[str, float]]:
+        """Thread-safely export calibrated link baselines for persistent storage."""
+        with self._lock:
+            return {
+                lid: {
+                    "baseline_rssi": round(link.baseline_rssi, 3),
+                    "baseline_std": round(link.baseline_std, 3),
+                }
+                for lid, link in self.links.items()
+                if link.baseline_rssi is not None
+            }
+
+    def import_baselines(self, baselines: dict[str, dict[str, Any]]) -> int:
+        """Thread-safely restore persisted baselines onto matching links."""
+        applied = 0
+        with self._lock:
+            for lid, vals in baselines.items():
+                link = self.links.get(lid)
+                if link is None or not isinstance(vals, dict):
+                    continue
+                b_rssi = vals.get("baseline_rssi")
+                if b_rssi is not None:
+                    link.baseline_rssi = float(b_rssi)
+                    applied += 1
+                b_std = vals.get("baseline_std")
+                if b_std is not None:
+                    link.baseline_std = max(0.25, float(b_std))
+        return applied
+
     def snapshot_links(self) -> list[tuple[str, str, float, float, float, float]]:
-        """Return an immutable snapshot of link geometries for thread-safe rendering."""
+        """Return an immutable 2D snapshot of link geometries (backward-compatible)."""
         with self._lock:
             return [
                 (
@@ -415,16 +487,49 @@ class RTIEngine:
                 for lid, link in self.links.items()
             ]
 
+    def snapshot_links_3d(
+        self,
+    ) -> list[tuple[str, str, float, float, float, float, float, float]]:
+        """Return an immutable 3D snapshot of link endpoints (x1, y1, z1, x2, y2, z2)."""
+        with self._lock:
+            return [
+                (
+                    lid,
+                    link.protocol,
+                    link.p1.x,
+                    link.p1.y,
+                    link.p1.z,
+                    link.p2.x,
+                    link.p2.y,
+                    link.p2.z,
+                )
+                for lid, link in self.links.items()
+            ]
+
     def _compute_sparse_link_weights(
-        self, x1: float, y1: float, x2: float, y2: float
-    ) -> list[tuple[int, float]]:
-        """Compute L2-normalized sparse Fresnel ellipse weights [(voxel_idx, weight)]."""
-        d_link = math.hypot(x2 - x1, y2 - y1)
+        self,
+        x1: float,
+        y1: float,
+        z1: float,
+        x2: float,
+        y2: float,
+        z2: float,
+    ) -> list[tuple[int, float, bool]]:
+        """Compute L2-normalized sparse Fresnel weights with per-voxel 3D height z(x, y).
+
+        Returns list of (voxel_idx, normalized_weight, is_low_voxel).
+        """
+        dx_seg = x2 - x1
+        dy_seg = y2 - y1
+        dz_seg = z2 - z1
+        seg_len_sq = dx_seg * dx_seg + dy_seg * dy_seg
+        d_link = math.sqrt(seg_len_sq)
         scale = 1.0 / math.sqrt(max(d_link, 0.5))
         lam = self.ellipse_excess_m
         cutoff = 3.5 * lam
+        mean_z = 0.5 * (z1 + z2)
 
-        raw_nz: list[tuple[int, float]] = []
+        raw_nz: list[tuple[int, float, bool]] = []
         sq_sum = 0.0
         for j, (vx, vy) in enumerate(self.voxels):
             d1 = math.hypot(vx - x1, vy - y1)
@@ -432,7 +537,16 @@ class RTIEngine:
             excess = (d1 + d2) - d_link
             if excess <= cutoff:
                 w = scale * math.exp(-excess / lam)
-                raw_nz.append((j, w))
+                if seg_len_sq > 1e-9:
+                    t = ((vx - x1) * dx_seg + (vy - y1) * dy_seg) / seg_len_sq
+                    if t < 0.0:
+                        t = 0.0
+                    elif t > 1.0:
+                        t = 1.0
+                    z_voxel = z1 + t * dz_seg
+                else:
+                    z_voxel = mean_z
+                raw_nz.append((j, w, z_voxel < LOW_HEIGHT_THRESHOLD_M))
                 sq_sum += w * w
 
         # Unit-L2 normalize each link's Fresnel kernel so voxel intensities are
@@ -440,8 +554,8 @@ class RTIEngine:
         if sq_sum > 1e-9:
             inv_norm = 1.0 / math.sqrt(sq_sum)
             return [
-                (j, w * inv_norm)
-                for j, w in raw_nz
+                (j, w * inv_norm, is_low)
+                for j, w, is_low in raw_nz
                 if (w * inv_norm) > 1e-6
             ]
         return []
@@ -460,9 +574,10 @@ class RTIEngine:
                 (
                     self.links[lid].p1.x,
                     self.links[lid].p1.y,
+                    self.links[lid].p1.z,
                     self.links[lid].p2.x,
                     self.links[lid].p2.y,
-                    self.links[lid].is_low_link,
+                    self.links[lid].p2.z,
                 )
                 for lid in link_order
             ]
@@ -483,21 +598,23 @@ class RTIEngine:
                     self._dirty_geometry = False
             return
 
-        # Step 1: Compute sparse Fresnel weights and vertical coverage maps
-        sparse_weights: list[list[tuple[int, float]]] = []
-        for x1, y1, x2, y2, is_low in link_specs:
-            nz = self._compute_sparse_link_weights(x1, y1, x2, y2)
+        # Step 1: Compute sparse Fresnel weights and voxel-exact 3D vertical coverage maps
+        sparse_weights: list[list[tuple[int, float, bool]]] = []
+        for x1, y1, z1, x2, y2, z2 in link_specs:
+            nz = self._compute_sparse_link_weights(x1, y1, z1, x2, y2, z2)
             sparse_weights.append(nz)
-            target_cov = low_cov if is_low else high_cov
-            for idx, w_val in nz:
+            for idx, w_val, is_low in nz:
                 r, c = divmod(idx, self.cols)
-                target_cov[r][c] += w_val
+                if is_low:
+                    low_cov[r][c] += w_val
+                else:
+                    high_cov[r][c] += w_val
 
         # Step 2: Compute B = C_x * W^T (N x M) on-the-fly via sparse inverted index
         # Maps each active voxel j -> [(link_idx, w_lj), ...], avoiding N x N storage.
         voxel_links: dict[int, list[tuple[int, float]]] = {}
         for l_idx, nz in enumerate(sparse_weights):
-            for j, wj in nz:
+            for j, wj, _ in nz:
                 voxel_links.setdefault(j, []).append((l_idx, wj))
 
         B = [[0.0] * m for _ in range(n)]
@@ -528,7 +645,7 @@ class RTIEngine:
         for l1 in range(m):
             nz1 = sparse_weights[l1]
             for l2 in range(l1, m):
-                val = sum(wj * B[j][l2] for j, wj in nz1)
+                val = sum(wj * B[j][l2] for j, wj, _ in nz1)
                 if l1 == l2:
                     val += self.noise_variance
                 A[l1][l2] = val
@@ -554,7 +671,7 @@ class RTIEngine:
                 self._dirty_geometry = False
 
     def reconstruct(self, now: float | None = None) -> RTIReconstruction:
-        """Reconstruct 2D attenuation heatmap and 3D vertical layer energy maps."""
+        """Reconstruct 2D attenuation heatmap and voxel-accurate 3D vertical layer energy maps."""
         if self._dirty_geometry:
             self.rebuild_projection()
 
@@ -588,7 +705,6 @@ class RTIEngine:
                 )
 
             delta_y: list[float] = [0.0] * m
-            is_low_flags: list[bool] = [False] * m
             link_perturbations: dict[str, float] = {}
             active_links = 0
 
@@ -596,10 +712,9 @@ class RTIEngine:
                 link = self.links.get(lid)
                 if link is None:
                     continue
-                is_low_flags[idx] = link.is_low_link
                 if (
                     link.last_rssi is not None
-                    and (ts - link.last_updated) <= DEFAULT_LINK_STALE_SECONDS
+                    and (ts - link.last_updated) <= link.stale_seconds
                 ):
                     active_links += 1
                 pert, _, _ = link.compute_perturbation(now=ts)
@@ -608,7 +723,7 @@ class RTIEngine:
                 if scaled > 0.0:
                     link_perturbations[lid] = round(scaled, 3)
 
-        # Heavy matrix-vector multiply & backprojection execute lock-free
+        # Heavy matrix-vector multiply & voxel-accurate 3D backprojection execute lock-free
         grid = [[0.0] * self.cols for _ in range(self.rows)]
         low_grid = [[0.0] * self.cols for _ in range(self.rows)]
         high_grid = [[0.0] * self.cols for _ in range(self.rows)]
@@ -619,16 +734,18 @@ class RTIEngine:
                 r, c = divmod(v_idx, self.cols)
                 grid[r][c] = val
 
-        # Backproject low-height and high-height link perturbations sparsely
+        # Backproject voxel-level low-height (<0.9m) and high-height (>=0.9m) energy
         for l_idx in range(m):
             dy = delta_y[l_idx]
             if dy <= 0.05:
                 continue
-            target = low_grid if is_low_flags[l_idx] else high_grid
-            for v_idx, w_val in sparse_weights[l_idx]:
+            for v_idx, w_val, is_low in sparse_weights[l_idx]:
                 if w_val > 1e-4:
                     r, c = divmod(v_idx, self.cols)
-                    target[r][c] += w_val * dy
+                    if is_low:
+                        low_grid[r][c] += w_val * dy
+                    else:
+                        high_grid[r][c] += w_val * dy
 
         return RTIReconstruction(
             width=self.cols,

@@ -1,13 +1,13 @@
 {
   "domain": "rf_presence_sense",
-  "name": "RF Presence Sense (Passive Wi-Fi & BLE Localization)",
+  "name": "RF Presence Sense (Passive Wi-Fi & BLE 3D Localization)",
   "codeowners": ["@fresht604"],
   "config_flow": true,
   "dependencies": [],
-  "after_dependencies": ["bluetooth"],
+  "after_dependencies": ["bluetooth", "http", "frontend"],
   "documentation": "https://github.com/fresht604/rf-presence-sense",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/fresht604/rf-presence-sense/issues",
   "requirements": [],
-  "version": "1.0.2"
+  "version": "2.0.0"
 }

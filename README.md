@@ -1,78 +1,85 @@
-# RF Presence Sense — Passive Positionsbestimmung von Menschen & Tieren über bestehende WLAN- & Bluetooth-Geräte
+# RF Presence Sense v2.0.0 — Passive 3D-Positionsbestimmung von Menschen & Tieren über bestehende WLAN- & Bluetooth-Geräte
 
 **Keine extra Hardware. Kein ESP32. Kein Bluetooth-Proxy.**
 
-`RF Presence Sense` ist eine Custom-Integration für Home Assistant, die **ausschließlich bereits eingebundene WLAN- und Bluetooth-Geräte** (Smart Plugs, Lampen, Schalter, Router/APs, BLE-Sensoren, TVs, etc.) nutzt, um **gerätelos (device-free)** die 2D-Positionen von Menschen und Tieren zu erfassen.
+`RF Presence Sense` ist eine Custom-Integration für Home Assistant, die **ausschließlich bereits eingebundene WLAN- und Bluetooth-Geräte** (Smart Plugs, Lampen, Schalter, Router/APs, BLE-Sensoren, TVs, etc.) nutzt, um **gerätelos (device-free)** Menschen und Tiere in einer **echten 3D-Live-Map** zu lokalisieren.
 
 ---
 
-## Wie funktioniert das physikalisch? (Radio Tomographic Imaging — RTI + VRTI)
+## Neu in v2.0.0
+
+- **Echte 3D-Live-Map (`camera`)**: Isometrische 3D-PNG-Karte (Zero-Dependency Pure-Python) mit 3D-Raumwänden, echten 3D-RF-Links auf Montagehöhe `z`, 3D-Mensch-/Tier-Figuren, verblassenden Bewegungspfaden (Trails), Raumnamen, Ziel-Konfidenz-Labels, Legende & Kalibrierungs-Banner.
+- **Interaktive 3D Custom Lovelace Card (`rf-presence-3d-card`)**: Direkt mitgelieferte HTML5-3D-Karte — frei drehbar per Maus/Touch, Zoom, 3D/2D-Umschalter, optionales eigenes Grundrissbild und **Drag-&-Drop-Edit-Modus** für Geräte, Empfänger & Räume!
+- **Vollständige Persistenz (`storage.py`)**: 3D-Gerätepositionen, Räume (Rechtecke & Polygone), kalibrierte Baselines und Live-Tuning bleiben über Home-Assistant-Neustarts und Reloads dauerhaft erhalten.
+- **Dynamische Raum-Sensoren & `delete_room`**: Neue Räume erhalten sofort automatisch ihre 3 Präsenz-Sensoren (`Präsenz`, `Mensch`, `Tier`).
+- **Menü-geführter Options-Flow**: Tuning & Grundriss, stationäre Geräte verwalten, 3D-Positionen bearbeiten und Räume anlegen/löschen direkt in der HA-UI.
+- **Live-Steuerung & Automations-Events**: Neue `button`-Entitäten (*Kalibrieren*, *Baseline zurücksetzen*), `number`-Slider (*Empfindlichkeit* live ohne Reload, *Kalibrierdauer*) sowie HA-Events (`rf_presence_sense_room_changed`, `rf_presence_sense_target_detected`, `rf_presence_sense_target_lost`).
+- **Genauigkeits-Upgrade**: Voxel-genaue 3D-Höheninterpolation $z(x, y)$ entlang jedes Links, präsenz-bewusste Baseline (kein Ausblenden ruhig sitzender Personen), dynamisches Multi-AP-Tracking (`ap_mac`/`bssid`), Polygon-Räume, HA-Area-Auto-Mapping und realistische Stale-Timeouts (Wi-Fi/Zigbee 600 s, BLE 180 s).
+- **Vollständige Mehrsprachigkeit (`de`/`en`) & HA-Diagnose-Export (`diagnostics.py`)**.
+
+---
+
+## Wie funktioniert das physikalisch? (Radio Tomographic Imaging — 3D RTI + VRTI)
 
 1. **Wasser absorbiert 2,4-GHz- und 5-GHz-Funkwellen:**
-   Menschen und Tiere bestehen zu ~60–70 % aus Wasser. Betritt ein Lebewesen die **1. Fresnel-Zone** zwischen einem stationären WLAN-Gerät und dem Router (oder einem stationären BLE-Gerät und dem Home-Assistant-Bluetooth-Adapter), verändert sich das Funkfeld messbar:
-   - **Shadowing (Dämpfung $\Delta y$):** Der RSSI-Wert fällt um typischerweise 2–10 dB ab.
-   - **VRTI (Variance-Based RTI):** Selbst bei starker Mehrwegeausbreitung (Multipath) steigt die kurzfristige **Varianz** des RSSI-Signals bei jeder Bewegung drastisch an.
-2. **2D-Tomographie (Woodbury-Dual-Inversion):**
-   Die Integration rekonstruiert aus allen aktiven WLAN- und BLE-Links in Echtzeit (< 1 ms in reinem Python, ohne schwere Abhängigkeiten) eine **2D-Dämpfungs-Heatmap** über deinen Grundriss.
-3. **Multi-Target Kalman-Tracker:**
-   Erkennt lokale Maxima mit Sub-Voxel-Genauigkeit, verfolgt mehrere Ziele gleichzeitig (Position $(x, y)$ + Geschwindigkeit) und ordnet sie deinen Räumen zu.
-4. **3D-Höhen- & Querschnitts-Klassifikation (Mensch vs. Tier):**
-   Jedes stationäre Gerät besitzt eine Montagehöhe $z$ (z. B. Smart-Plug an der Steckdose $z \approx 0{,}35\text{ m}$ vs. Lampe/Sensor $z \approx 1{,}8\text{ m}$):
-   - **Tier (Katze/Hund):** Stört primär bodennahe Links ($z < 0{,}9\text{ m}$) bei kleinerem Funkquerschnitt, während höherliegende Links darüber ruhig bleiben.
-   - **Mensch:** Stört sowohl niedrige als auch höhere Links ($z \ge 0{,}9\text{ m}$) mit stärkerer Dämpfung und größerem räumlichen Schatten.
+   Menschen und Tiere bestehen zu ~60–70 % aus Wasser. Betritt ein Lebewesen die **1. Fresnel-Zone** zwischen einem stationären WLAN-Gerät und dem Router (oder einem BLE-Gerät und dem HA-Bluetooth-Adapter), verändert sich das Funkfeld messbar (**Shadowing** + **VRTI-Varianz**).
+2. **2D/3D-Tomographie (Woodbury-Dual-Inversion):**
+   Die Integration rekonstruiert aus allen aktiven WLAN- und BLE-Links in reinem Python (ohne schwere Abhängigkeiten, ARM64-optimiert, im Executor-Pool ausgelagert) die räumliche Dämpfungsverteilung.
+3. **Voxel-genaue 3D-Höhenattribution (Mensch vs. Tier):**
+   Für jeden Voxel entlang einer Funkstrecke $p_1(x_1, y_1, z_1) \to p_2(x_2, y_2, z_2)$ wird die exakte Linienhöhe $z(x, y)$ interpoliert:
+   - **Tier (Katze/Hund):** Stört primär bodennahe Abschnitte ($z < 0{,}9\text{ m}$) bei kleinerem Funkquerschnitt.
+   - **Mensch:** Stört sowohl bodennahe als auch höhere Funkabschnitte ($z \ge 0{,}9\text{ m}$) mit stärkerer Dämpfung und größerem Schatten.
 
 ---
 
-## Unterstützte bestehende Datenquellen in Home Assistant
+## Interaktive 3D Lovelace Card einbinden
 
-- **WLAN- & IoT-RSSI-Entitäten:** Automatische Erkennung aller Sensoren mit `device_class: signal_strength`, Einheit `dBm` oder Namen wie `*_rssi`, `*_wifi_signal`, `*_signal_strength` (z. B. Shelly, Tasmota, ESPHome, TP-Link/Kasa, Meross, Fritz!Box, UniFi, OpenWrt, ASUSWRT).
-- **`device_tracker`-Attribute:** Liest `rssi` / `signal_strength` direkt aus Router-Integrationen (UniFi, Fritz!Box, OpenWrt, MikroTik, Omada).
-- **Zigbee/Thread-Bonus-Links:** Optional werden auch `linkquality` (LQI) Werte linear in Pseudo-dBm umgerechnet.
-- **Natives Home Assistant Bluetooth:** Klinkt sich passiv (`BluetoothScanningMode.PASSIVE`) in den bereits vorhandenen Home-Assistant-Bluetooth-Stack ein und liest alle Werbepakete (Advertisements) stationärer BLE-Geräte in Echtzeit aus.
+Die Karte wird beim Start der Integration automatisch unter `/rf_presence_sense/rf-presence-3d-card.js` bereitgestellt und ins Frontend geladen. Füge im Dashboard einfach eine manuelle Karte hinzu:
+
+```yaml
+type: custom:rf-presence-3d-card
+title: RF Presence Sense 3D
+entity: sensor.rf_presence_sense_positionen_ziele
+# Optional: eigenes Grundrissbild auf den 3D-Boden projizieren
+# floorplan_image: /local/grundriss.png
+height: 450
+```
+
+Alternativ kannst du die serverseitig gerenderte 3D-Live-Map-Kamera `camera.rf_presence_sense_3d_live_rf_map` in jeder Standard-*Picture Entity*-Karte nutzen (auch ideal für die HA Companion App).
 
 ---
 
-## Installation
+## Automations-Events
 
-1. Kopiere den Ordner `custom_components/rf_presence_sense` in dein Home-Assistant-Verzeichnis `/config/custom_components/rf_presence_sense`.
-2. Starte Home Assistant neu.
-3. Gehe zu **Einstellungen → Geräte & Dienste → Integration hinzufügen → „RF Presence Sense“**.
-4. Gib deine Grundrissmaße und die 3D-Position von Router & Home-Assistant-Host ein und wähle deine **stationären** WLAN- und Bluetooth-Geräte aus.
+Die Integration feuert bei Zustandsübergängen folgende Events auf dem Home-Assistant-Event-Bus:
 
----
-
-## Einrichtung & Kalibrierung für maximale Genauigkeit
-
-1. **Gerätepositionen $(x, y, z)$ hinterlegen:**
-   Nutze den Service `rf_presence_sense.set_device_position` für deine wichtigsten Geräte (insbesondere die Höhe $z$ in Metern für die Mensch/Tier-Unterscheidung!).
-2. **Räume definieren:**
-   Nutze `rf_presence_sense.define_room`, um Raumzonen anzulegen.
-3. **Leeren Raum kalibrieren:**
-   Rufe `rf_presence_sense.calibrate_empty_room` (z. B. 20–30 Sekunden) auf, wenn niemand im Raum ist. Dadurch werden Grundrauschen und exakte Baseline jedes Links eingelernt.
-4. **Live-Heatmap im Dashboard anzeigen:**
-   Füge die Kamera-Entität `camera.rf_presence_sense_live_rf_heatmap` als *Picture Entity* Karte zu deinem Dashboard hinzu.
+| Event | Beschreibung & Felder |
+|---|---|
+| `rf_presence_sense_room_changed` | Ziel wechselt den Raum (`track_id`, `type`, `from_room_id`, `from_room`, `to_room_id`, `to_room`, `x`, `y`, `confidence`) |
+| `rf_presence_sense_target_detected` | Neues Lebewesen erkannt (`track_id`, `type`, `room_id`, `room`, `x`, `y`, `confidence`) |
+| `rf_presence_sense_target_lost` | Ziel nicht mehr erkannt (`track_id`, `type`, `last_room_id`, `last_room`) |
 
 ---
 
 ## Bereitgestellte Entitäten
 
-| Entität | Beschreibung |
-|---|---|
-| `sensor.rf_presence_sense_erkannte_menschen` | Anzahl aktuell erkannter Menschen |
-| `sensor.rf_presence_sense_erkannte_tiere` | Anzahl aktuell erkannter Tiere |
-| `sensor.rf_presence_sense_erkannte_lebewesen_gesamt` | Gesamtzahl erkannter Lebewesen |
-| `sensor.rf_presence_sense_positionen_ziele` | Status + Attribute mit exakten `(x, y)`-Koordinaten, Geschwindigkeit, Typ, Konfidenz & Raum |
-| `sensor.rf_presence_sense_rf_netz_abdeckung` | Anteil aktiver RF-Links (%) & Paket-Zähler |
-| `binary_sensor.rf_presence_sense_mensch_erkannt` | Global: Mensch erkannt |
-| `binary_sensor.rf_presence_sense_tier_erkannt` | Global: Tier erkannt |
-| `binary_sensor.rf_presence_sense_<raum>_prasenz` / `_mensch` / `_tier` | Raumbezogene Präsenz-Sensoren |
-| `camera.rf_presence_sense_live_rf_heatmap` | Live-SVG-Karte mit Heatmap, RF-Links, Räumen & Zielmarkern |
+| Plattform | Entität | Beschreibung |
+|---|---|---|
+| `sensor` | Erkannte Menschen / Tiere / Gesamt | Aktuelle Anzahl erkannter Lebewesen |
+| `sensor` | Positionen & Ziele | Status + 3D-Zieldaten, Räume, Links & Trails (Recorder-geschützt) |
+| `sensor` | RF-Netz Abdeckung | Anteil aktiver RF-Links (%) & Paket-Zähler |
+| `binary_sensor` | Mensch erkannt / Tier erkannt | Globale Präsenz |
+| `binary_sensor` | `<Raum>` Präsenz / Mensch / Tier | Dynamische Raum-Präsenz-Sensoren |
+| `camera` | 3D Live RF-Map | Isometrische 3D-PNG-Live-Karte mit Labels, Trails & Legende |
+| `button` | Leeren Raum kalibrieren / Baseline zurücksetzen | Ein-Klick-Kalibrierung im Dashboard |
+| `number` | Empfindlichkeit / Kalibrierdauer | Live-Feintuning ohne Neustart |
 
 ---
 
-## Praktische Tipps & physikalische Grenzen
+## Services
 
-- **Je mehr stationäre Geräte & sich kreuzende Links, desto genauer die Ortung:** Ideal sind 8–20+ stationäre Geräte (Steckdosen + Lampen + BLE-Sensoren), idealerweise über 2+ Empfänger (z. B. WLAN-Router + HA-Bluetooth-Adapter an unterschiedlichen Stellen, oder mehrere Mesh-APs).
-- **Keine mobilen Geräte auswählen:** Handys oder Smartwatches verfälschen die Tomographie, weil sie sich selbst bewegen.
-- **Abtastrate:** Natives Bluetooth liefert oft 1–5 Pakete/Sekunde (ideal!). Bei WLAN-Geräten (Shelly/Tasmota/UniFi) hängt die Reaktionszeit vom jeweiligen RSSI-Update-Intervall ab.
-- **Realistische Genauigkeit:** Mit reinem RSSI (ohne Wi-Fi-CSI-Spezialhardware) sind je nach Link-Dichte **Raum- bis ~0,8–1,5 m Zonen-Genauigkeit** realistisch erreichbar.
+- `rf_presence_sense.calibrate_empty_room` — Leer-Raum-Kalibrierung starten & dauerhaft speichern
+- `rf_presence_sense.reset_baseline` — Baselines sofort zurücksetzen & speichern
+- `rf_presence_sense.set_device_position` — 3D-Position `(x, y, z)` für Gerät/Empfänger dauerhaft festlegen
+- `rf_presence_sense.define_room` — Rechteckigen oder Polygon-Raum (`polygon: [[x,y], ...]`) anlegen/aktualisieren
+- `rf_presence_sense.delete_room` — Raumzone dauerhaft entfernen

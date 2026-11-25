@@ -14,6 +14,14 @@ COMP_DIR = (
     / "rf_presence_sense"
 )
 
+# In-memory backing store for stubbed homeassistant.helpers.storage.Store
+_STUB_STORAGE_BACKING: dict[str, Any] = {}
+
+
+def reset_stub_storage() -> None:
+    """Clear in-memory stub storage between tests."""
+    _STUB_STORAGE_BACKING.clear()
+
 
 def _install_ha_stubs() -> None:
     """Install minimal Home Assistant module stubs if homeassistant is not installed."""
@@ -77,6 +85,28 @@ def _install_ha_stubs() -> None:
     event_mod = _make_mod("homeassistant.helpers.event")
     event_mod.async_track_state_change_event = lambda hass, eids, cb: (lambda: None)  # type: ignore[attr-defined]
 
+    storage_mod = _make_mod("homeassistant.helpers.storage")
+
+    class Store:  # noqa: D101
+        def __class_getitem__(cls, _item: Any) -> type:
+            return cls
+
+        def __init__(self, hass: Any, version: int, key: str) -> None:
+            self.hass = hass
+            self.version = version
+            self.key = key
+
+        async def async_load(self) -> Any:
+            return _STUB_STORAGE_BACKING.get(self.key)
+
+        async def async_save(self, data: Any) -> None:
+            _STUB_STORAGE_BACKING[self.key] = data
+
+        async def async_remove(self) -> None:
+            _STUB_STORAGE_BACKING.pop(self.key, None)
+
+    storage_mod.Store = Store  # type: ignore[attr-defined]
+
     dev_reg = _make_mod("homeassistant.helpers.device_registry")
     dev_reg.DeviceInfo = dict  # type: ignore[attr-defined]
 
@@ -110,6 +140,13 @@ def _install_ha_stubs() -> None:
 
         def __init__(self, coordinator: Any) -> None:
             self.coordinator = coordinator
+
+        @property
+        def available(self) -> bool:
+            return True
+
+        def async_write_ha_state(self) -> None:
+            pass
 
     upd_coord.DataUpdateCoordinator = DataUpdateCoordinator  # type: ignore[attr-defined]
     upd_coord.CoordinatorEntity = CoordinatorEntity  # type: ignore[attr-defined]
@@ -145,6 +182,25 @@ def _install_ha_stubs() -> None:
 
     bs_mod.BinarySensorEntity = BinarySensorEntity  # type: ignore[attr-defined]
     bs_mod.BinarySensorDeviceClass = BinarySensorDeviceClass  # type: ignore[attr-defined]
+
+    btn_mod = _make_mod("homeassistant.components.button")
+
+    class ButtonEntity:  # noqa: D101
+        pass
+
+    btn_mod.ButtonEntity = ButtonEntity  # type: ignore[attr-defined]
+
+    num_mod = _make_mod("homeassistant.components.number")
+
+    class NumberEntity:  # noqa: D101
+        pass
+
+    class NumberMode:  # noqa: D101
+        SLIDER = "slider"
+        BOX = "box"
+
+    num_mod.NumberEntity = NumberEntity  # type: ignore[attr-defined]
+    num_mod.NumberMode = NumberMode  # type: ignore[attr-defined]
 
 
 def _ensure_package() -> str:

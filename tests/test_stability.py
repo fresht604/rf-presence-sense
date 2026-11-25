@@ -480,6 +480,157 @@ class TestRecorderProtectionAndCoordinator(unittest.TestCase):
 
         _run_async(_run())
 
+    def test_worst_case_3d_state_payload_under_16kb(self) -> None:
+        """At 80 links + 16 targets (15-pt trails) + 40 peaks, JSON payload must stay < 16 KB."""
+        import json
+
+        hass = _FakeHass()
+        devices = {
+            f"sensor.shelly_plug_room_{i}_rssi": {
+                "name": f"Shelly Plug Room {i}",
+                "protocol": "wifi" if i < 40 else "ble",
+                "receiver_id": "router_main" if i < 40 else "ha_bluetooth",
+                "x": float(i % 10),
+                "y": float(i // 10),
+                "z": 0.45 if i % 2 == 0 else 1.5,
+            }
+            for i in range(MAX_LINKS)
+        }
+        entry = types.SimpleNamespace(
+            entry_id="size_test",
+            data={
+                "floor_width": 12.0,
+                "floor_height": 10.0,
+                "enable_ble": False,
+                "enable_wifi_entities": False,
+                "devices": devices,
+            },
+            options={},
+        )
+        coord = _coordinator_mod.RFPresenceCoordinator(hass, entry)
+        for i, lid in enumerate(coord.engine.links):
+            lnk = coord.engine.links[lid]
+            lnk.baseline_rssi = -60.0
+            lnk.add_sample(-65.0 if i % 3 == 0 else -60.0, now=100.0)
+
+        targets = [
+            _tracker.TrackedTarget(
+                track_id=i + 1,
+                x=1.0 + (i % 4) * 2.0,
+                y=1.0 + (i // 4) * 2.0,
+                human_score=0.9,
+                room_id="wohnraum",
+                room_name="Wohnraum",
+            )
+            for i in range(TRACKER_MAX_TRACKS)
+        ]
+        for t in targets:
+            for step in range(_const.TRACKER_TRAIL_MAXLEN):
+                t.trail.append((t.x + step * 0.05, t.y + step * 0.05))
+
+        async def _run() -> None:
+            with (
+                patch.object(coord.tracker, "update", return_value=targets),
+                patch("time.monotonic", return_value=101.0),
+            ):
+                data = await coord._async_update_data()
+            coord.data = data
+            sensor = _sensor_mod.RFTargetsDetailSensor(coord, entry)
+            payload_bytes = len(json.dumps(sensor.extra_state_attributes))
+            self.assertLess(
+                payload_bytes,
+                16384,
+                f"3D detail sensor payload too large: {payload_bytes} bytes",
+            )
+            await coord.async_shutdown()
+            self.assertEqual(len(coord._room_listeners), 0)
+
+        _run_async(_run())
+
+    def test_camera_survives_extreme_and_nonfinite_coordinates(self) -> None:
+        """3D PNG renderer must clamp NaN/Inf/huge coordinates without hanging."""
+        engine = RTIEngine(floor_width=10.0, floor_height=8.0, resolution=0.5)
+        fake_coord = types.SimpleNamespace(
+            floor_width=10.0,
+            floor_height=8.0,
+            engine=engine,
+            rooms=[_tracker.RoomZone("r1", "Bad", -1e6, 0.0, 1e6, 8.0)],
+            devices={
+                "d1": {
+                    "x": float("nan"),
+                    "y": float("inf"),
+                    "z": 999.0,
+                    "protocol": "wifi",
+                }
+            },
+            receivers={"r1": {"x": 1e9, "y": -1e9, "z": -50.0, "name": "RX"}},
+            last_reconstruction=None,
+            last_targets=[
+                _tracker.TrackedTarget(
+                    track_id=1, x=1e7, y=-1e7, vx=1e5, vy=1e5, human_score=0.9
+                )
+            ],
+            recon_seq=1,
+            _calibrating=False,
+        )
+        png = _camera_mod.render_heatmap_png(fake_coord, w_px=640, h_px=480)
+        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertTrue(png.endswith(b"IEND\xaeB`\x82"))
+
+    def test_translation_files_key_parity(self) -> None:
+        """strings.json, translations/de.json, and translations/en.json must have identical key trees."""
+        import json
+        from pathlib import Path
+
+        comp = (
+            Path(__file__).resolve().parents[1]
+            / "custom_components"
+            / "rf_presence_sense"
+        )
+
+        def _keys(obj, prefix=""):
+            out = set()
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    path = f"{prefix}.{k}" if prefix else k
+                    out.add(path)
+                    out.update(_keys(v, path))
+            return out
+
+        k_str = _keys(json.loads((comp / "strings.json").read_text(encoding="utf-8")))
+        k_de = _keys(
+            json.loads((comp / "translations" / "de.json").read_text(encoding="utf-8"))
+        )
+        k_en = _keys(
+            json.loads((comp / "translations" / "en.json").read_text(encoding="utf-8"))
+        )
+        self.assertEqual(k_str, k_de)
+        self.assertEqual(k_str, k_en)
+
+    def test_away_entity_unavailable_falls_back_to_targets(self) -> None:
+        """An unavailable away_entity must not permanently freeze baseline adaptation."""
+        hass = _FakeHass()
+        hass.states = types.SimpleNamespace(
+            get=lambda _eid: types.SimpleNamespace(state="unavailable"),
+            async_all=lambda: [],
+        )
+        entry = types.SimpleNamespace(
+            entry_id="away_test",
+            data={
+                "enable_ble": False,
+                "enable_wifi_entities": False,
+                "presence_aware_baseline": True,
+                "away_entity": "zone.home",
+            },
+            options={},
+        )
+        coord = _coordinator_mod.RFPresenceCoordinator(hass, entry)
+        coord.last_targets = []
+        self.assertFalse(coord._should_freeze_baseline())
+        coord.last_targets = [_tracker.TrackedTarget(track_id=1, x=2.0, y=2.0)]
+        self.assertTrue(coord._should_freeze_baseline())
+        coord.async_shutdown_collector()
+
 
 if __name__ == "__main__":
     unittest.main()
