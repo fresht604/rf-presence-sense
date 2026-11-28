@@ -469,9 +469,9 @@ class TestWindowsPlacementAndBudget(unittest.TestCase):
             / "custom_components"
             / "rf_presence_sense"
         )
-        self.assertEqual(_const.VERSION, "2.2.0")
+        self.assertEqual(_const.VERSION, "2.2.1")
         manifest = json.loads((base / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "2.2.0")
+        self.assertEqual(manifest["version"], "2.2.1")
 
         # Check translations are 100% key-synchronized and contain no literal ICU-breaking {edge...}
         strings = json.loads((base / "strings.json").read_text(encoding="utf-8"))
@@ -504,6 +504,79 @@ class TestWindowsPlacementAndBudget(unittest.TestCase):
         self.assertIn("(38 * Math.PI) / 180", js)
         self.assertIn("Ruhend", js)
         self.assertIn("base.wn", js)
+
+    def test_v221_link_median_warmup_suppresses_initial_noise_spikes(self) -> None:
+        """New links must warm up over 3 samples using median baseline and emit 0.0 during warmup."""
+        link = RFLink(
+            link_id="ble_new->proxy1",
+            device_id="ble_new",
+            receiver_id="proxy1",
+            protocol="ble",
+            p1=Point3D(1.0, 1.0, 1.0),
+            p2=Point3D(5.0, 5.0, 1.0),
+        )
+        self.assertIsNone(link.baseline_rssi)
+
+        # Sample 1: noisy outlier (-82 dBm) -> still warming up, perturbation must be 0.0
+        link.add_sample(-82.0, now=10.0)
+        self.assertIsNone(link.baseline_rssi)
+        self.assertEqual(link.compute_perturbation(now=10.5), (0.0, 0.0, 0.0))
+
+        # Sample 2: normal reading (-60 dBm) -> still warming up
+        link.add_sample(-60.0, now=12.0)
+        self.assertIsNone(link.baseline_rssi)
+        self.assertEqual(link.compute_perturbation(now=12.5), (0.0, 0.0, 0.0))
+
+        # Sample 3: normal reading (-61 dBm) -> locks baseline to median (-61.0), ignoring -82 outlier!
+        link.add_sample(-61.0, now=14.0)
+        self.assertAlmostEqual(link.baseline_rssi, -61.0, places=3)
+
+    def test_v221_sidelobe_pruning_min_separation_and_min_hits_3(self) -> None:
+        """Verify 1.05 base threshold, 1.8m separation, 36% sidelobe pruning & min_hits=3."""
+        self.assertAlmostEqual(_const.DETECTION_THRESHOLD_BASE, 1.05, places=3)
+        self.assertEqual(_const.TRACKER_MIN_HITS, 3)
+
+        cols, rows, res = 16, 12, 0.5
+        grid = [[0.0] * cols for _ in range(rows)]
+        low_g = [[0.0] * cols for _ in range(rows)]
+        high_g = [[0.0] * cols for _ in range(rows)]
+        cov = [[1.0] * cols for _ in range(rows)]
+
+        # 1. Dominant main peak at (2.25, 2.25) -> 3.0
+        grid[4][4] = 3.0
+        high_g[4][4] = 2.5
+        # 2. Too-close artifact at (3.25, 2.25) -> 2.1 (distance 1.0m < 1.8m -> pruned!)
+        grid[4][6] = 2.1
+        # 3. Weak sidelobe at (6.25, 2.25) -> 1.0 (< 0.36 * 3.0 = 1.08 -> pruned!)
+        grid[4][12] = 1.0
+        # 4. Real second target at (6.25, 5.25) -> 1.45 (>= 1.08 and >= 1.8m away -> kept!)
+        grid[10][12] = 1.45
+        high_g[10][12] = 1.2
+
+        recon = RTIReconstruction(
+            width=cols,
+            height=rows,
+            resolution=res,
+            grid=grid,
+            low_layer_grid=low_g,
+            high_layer_grid=high_g,
+            low_coverage_grid=cov,
+            high_coverage_grid=cov,
+            active_links=6,
+            total_links=6,
+            link_perturbations={"d1->r1": 3.0},
+        )
+        peaks = _tracker.extract_peaks(recon)
+        self.assertEqual(len(peaks), 2, f"Expected 2 peaks after pruning, got {peaks}")
+        self.assertAlmostEqual(peaks[0].intensity, 3.0, places=2)
+        self.assertAlmostEqual(peaks[1].intensity, 1.45, places=2)
+
+        # Default tracker requires TRACKER_MIN_HITS=3 consistent frames before confirming
+        tracker = MultiTargetTracker(rooms=[RoomZone("az", "Arbeitszimmer", 0.0, 0.0, 8.0, 6.0)])
+        single = _make_single_peak_recon(2.25, 2.25, intensity=2.5)
+        self.assertEqual(len(tracker.update(single, dt=4.0)), 0)
+        self.assertEqual(len(tracker.update(single, dt=4.0)), 0)
+        self.assertEqual(len(tracker.update(single, dt=4.0)), 1)
 
 
 if __name__ == "__main__":

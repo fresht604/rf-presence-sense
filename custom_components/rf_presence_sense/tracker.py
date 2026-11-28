@@ -25,6 +25,9 @@ from .const import (
     TRACKER_MAX_MISSED_STATIONARY,
     TRACKER_MAX_TRACKS,
     TRACKER_MIN_HITS,
+    TRACKER_MIN_SEPARATION_M,
+    TRACKER_SIDELOBE_MAIN_THRESHOLD,
+    TRACKER_SIDELOBE_RATIO,
     TRACKER_STATIONARY_DWELL_SECONDS,
     TRACKER_STATIONARY_HYSTERESIS,
     TRACKER_STATIONARY_SPEED_MPS,
@@ -294,8 +297,9 @@ class TrackedTarget:
 def extract_peaks(
     recon: RTIReconstruction,
     threshold: float = DETECTION_THRESHOLD_BASE,
-    min_separation_m: float = 1.2,
+    min_separation_m: float = TRACKER_MIN_SEPARATION_M,
     max_peaks: int = MAX_TRACKS,
+    apply_sidelobe_pruning: bool = True,
 ) -> list[DetectionPeak]:
     """Extract sub-voxel local maxima from an RTI attenuation grid."""
     grid = recon.grid
@@ -329,11 +333,19 @@ def extract_peaks(
             if is_max:
                 candidates.append((val, r, c))
 
-    # Sort strongest peaks first and enforce minimum spatial separation
+    # Sort strongest peaks first, prune weak RTI sidelobes, and enforce minimum spatial separation
     candidates.sort(key=lambda item: item[0], reverse=True)
+    max_peak_val = candidates[0][0] if candidates else 0.0
+    sidelobe_floor = (
+        max_peak_val * TRACKER_SIDELOBE_RATIO
+        if (apply_sidelobe_pruning and max_peak_val >= TRACKER_SIDELOBE_MAIN_THRESHOLD)
+        else 0.0
+    )
     peaks: list[DetectionPeak] = []
 
     for val, r, c in candidates:
+        if sidelobe_floor > 0.0 and val < sidelobe_floor:
+            break
         # Sub-voxel centroid refinement in 3x3 window
         w_sum = 0.0
         wx_sum = 0.0
@@ -549,6 +561,7 @@ class MultiTargetTracker:
                 recon,
                 threshold=hyst_threshold,
                 max_peaks=self.max_tracks,
+                apply_sidelobe_pruning=False,
             )
             hyst_pairs: list[tuple[float, int, int]] = []
             for tid, track in unmatched_confirmed:

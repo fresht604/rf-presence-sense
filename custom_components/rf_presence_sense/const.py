@@ -4,7 +4,7 @@ from __future__ import annotations
 
 DOMAIN = "rf_presence_sense"
 NAME = "RF Presence Sense"
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 PLATFORMS = ["sensor", "binary_sensor", "camera", "button", "number"]
 
@@ -47,6 +47,7 @@ DEFAULT_BASELINE_ALPHA = 0.015  # Slow EWMA baseline adaptation rate
 DEFAULT_WINDOW_SECONDS = 12.0  # Sliding window for variance/smoothing
 DEFAULT_LONG_WINDOW_SECONDS = 30.0  # Longer micro-motion/breathing variance window
 LINK_BASELINE_FREEZE_SHADOWING_DB = 1.2  # Freeze per-link baseline when shadowed >= 1.2 dB
+LINK_WARMUP_SAMPLES = 3  # Median warmup samples before a new link locks initial baseline
 DEFAULT_LINK_STALE_SECONDS = 180.0  # Default fallback stale timeout (BLE)
 STALE_SECONDS_BLE = 180.0  # BLE advertisements stale timeout
 STALE_SECONDS_WIFI = 600.0  # Stationary Wi-Fi RSSI entities report less frequently
@@ -56,7 +57,7 @@ STALE_SECONDS_ZIGBEE = 600.0  # Stationary Zigbee LQI entities report less frequ
 LOW_HEIGHT_THRESHOLD_M = 0.90  # Links/voxels below this height see pets & human legs
 HUMAN_ATTENUATION_THRESHOLD = 1.85  # Effective attenuation units for human body
 ANIMAL_ATTENUATION_THRESHOLD = 0.65  # Effective attenuation units for pet body
-DETECTION_THRESHOLD_BASE = 0.55  # Base voxel threshold for target detection
+DETECTION_THRESHOLD_BASE = 1.05  # Base voxel threshold for target detection
 
 # Resource & stability limits (prevent OOM / event-loop stalls on ARM SBCs)
 MAX_VOXELS = 500  # Auto-upscale grid resolution if floorplan exceeds this
@@ -75,7 +76,10 @@ LINK_HEALTH_HEARTBEAT_SECONDS = 30.0  # Max interval between link_health state w
 
 # Tracker defaults
 TRACKER_MAX_ASSOC_DIST_M = 2.2
-TRACKER_MIN_HITS = 2
+TRACKER_MIN_HITS = 3
+TRACKER_MIN_SEPARATION_M = 1.8  # Minimum spatial distance between distinct RTI peaks
+TRACKER_SIDELOBE_MAIN_THRESHOLD = 1.6  # Main peak strength activating relative sidelobe pruning
+TRACKER_SIDELOBE_RATIO = 0.36  # Discard secondary sidelobes below 36% of dominant peak
 TRACKER_MAX_MISSED = 4
 TRACKER_MAX_MISSED_STATIONARY = 12  # ~48s hold time at 4s update interval when stationary
 TRACKER_STATIONARY_HYSTERESIS = 0.55  # Confirmed targets hold down to 0.55 * threshold

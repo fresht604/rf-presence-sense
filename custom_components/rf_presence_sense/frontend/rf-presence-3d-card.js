@@ -1,5 +1,5 @@
 /**
- * RF Presence Sense — Interactive 3D Sidebar Panel & Custom Lovelace Card (v2.2.0)
+ * RF Presence Sense — Interactive 3D Sidebar Panel & Custom Lovelace Card (v2.2.1)
  * Pure Vanilla JS + HTML5 3D Canvas (zero external dependencies, 0% idle CPU).
  *
  * Exports two Web Components:

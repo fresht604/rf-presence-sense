@@ -35,6 +35,7 @@ from .const import (
     DEFAULT_VARIANCE_WEIGHT,
     DEFAULT_WINDOW_SECONDS,
     LINK_BASELINE_FREEZE_SHADOWING_DB,
+    LINK_WARMUP_SAMPLES,
     LOW_HEIGHT_THRESHOLD_M,
     MAX_CALIBRATION_SAMPLES,
     MAX_FINGERPRINTS,
@@ -110,6 +111,7 @@ class RFLink:
     calibration_samples: deque[float] = field(
         default_factory=lambda: deque(maxlen=MAX_CALIBRATION_SAMPLES)
     )
+    _warmup_samples: list[float] = field(default_factory=list)
 
     @property
     def distance_2d(self) -> float:
@@ -172,7 +174,15 @@ class RFLink:
             return
 
         if self.baseline_rssi is None:
-            self.baseline_rssi = val
+            self._warmup_samples.append(val)
+            if len(self._warmup_samples) >= LINK_WARMUP_SAMPLES:
+                ordered = sorted(self._warmup_samples)
+                mid = len(ordered) // 2
+                if len(ordered) % 2 == 1:
+                    self.baseline_rssi = ordered[mid]
+                else:
+                    self.baseline_rssi = 0.5 * (ordered[mid - 1] + ordered[mid])
+                self._warmup_samples.clear()
             return
 
         # Presence-aware baseline: skip drift when targets/presence freeze adaptation
@@ -213,6 +223,7 @@ class RFLink:
             var = sum((v - mean) ** 2 for v in self.calibration_samples) / (n - 1)
             self.baseline_std = max(0.25, math.sqrt(var))
         self.calibration_samples.clear()
+        self._warmup_samples.clear()
 
     def reset_baseline(self) -> None:
         """Reset adaptive baseline to current smoothed reading."""
@@ -221,6 +232,7 @@ class RFLink:
             self.baseline_rssi = sum(vals) / len(vals)
         elif self.last_rssi is not None:
             self.baseline_rssi = self.last_rssi
+        self._warmup_samples.clear()
 
     def compute_perturbation(
         self,
@@ -593,6 +605,7 @@ class RTIEngine:
                 if link.baseline_rssi is None:
                     link.baseline_rssi = existing.baseline_rssi
                     link.baseline_std = existing.baseline_std
+                    link._warmup_samples = existing._warmup_samples
                 link.last_rssi = existing.last_rssi
                 link.last_updated = existing.last_updated
                 link.calibration_samples = existing.calibration_samples
@@ -689,6 +702,7 @@ class RTIEngine:
                 b_rssi = vals.get("baseline_rssi")
                 if b_rssi is not None:
                     link.baseline_rssi = float(b_rssi)
+                    link._warmup_samples.clear()
                     applied += 1
                 b_std = vals.get("baseline_std")
                 if b_std is not None:

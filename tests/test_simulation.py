@@ -46,7 +46,9 @@ class TestApartmentSimulation(unittest.TestCase):
     """Simulates a 8m x 6m apartment with existing Wi-Fi & BLE devices."""
 
     def _build_apartment(self) -> tuple[RTIEngine, MultiTargetTracker]:
-        engine = RTIEngine(floor_width=8.0, floor_height=6.0, resolution=0.5)
+        engine = RTIEngine(
+            floor_width=8.0, floor_height=6.0, resolution=0.5, sensitivity=1.5
+        )
         rooms = [
             RoomZone("wohnzimmer", "Wohnzimmer", 0.0, 0.0, 4.5, 6.0),
             RoomZone("kueche", "Küche", 4.5, 0.0, 8.0, 6.0),
