@@ -34,6 +34,7 @@ from .const import (
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
     MAX_LINKS,
+    MIN_UPDATE_INTERVAL,
     PROTOCOL_BLE,
     PROTOCOL_WIFI,
 )
@@ -63,7 +64,9 @@ class RFPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_FLOOR_WIDTH: float(user_input[CONF_FLOOR_WIDTH]),
                 CONF_FLOOR_HEIGHT: float(user_input[CONF_FLOOR_HEIGHT]),
                 CONF_GRID_RESOLUTION: float(user_input[CONF_GRID_RESOLUTION]),
-                CONF_UPDATE_INTERVAL: float(user_input[CONF_UPDATE_INTERVAL]),
+                CONF_UPDATE_INTERVAL: max(
+                    MIN_UPDATE_INTERVAL, float(user_input[CONF_UPDATE_INTERVAL])
+                ),
                 CONF_SENSITIVITY: float(user_input[CONF_SENSITIVITY]),
                 CONF_ENABLE_WIFI_ENTITIES: bool(
                     user_input[CONF_ENABLE_WIFI_ENTITIES]
@@ -120,7 +123,10 @@ class RFPresenceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_UPDATE_INTERVAL, default=DEFAULT_UPDATE_INTERVAL
                 ): selector.NumberSelector(
                     selector.NumberSelectorConfig(
-                        min=0.5, max=10.0, step=0.5, unit_of_measurement="s"
+                        min=MIN_UPDATE_INTERVAL,
+                        max=30.0,
+                        step=0.5,
+                        unit_of_measurement="s",
                     )
                 ),
                 vol.Required(
@@ -294,7 +300,9 @@ class RFPresenceOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             new_options = dict(entry.options)
             new_options[CONF_SENSITIVITY] = float(user_input[CONF_SENSITIVITY])
-            new_options[CONF_UPDATE_INTERVAL] = float(user_input[CONF_UPDATE_INTERVAL])
+            new_options[CONF_UPDATE_INTERVAL] = max(
+                MIN_UPDATE_INTERVAL, float(user_input[CONF_UPDATE_INTERVAL])
+            )
             new_options[CONF_FLOOR_WIDTH] = float(user_input[CONF_FLOOR_WIDTH])
             new_options[CONF_FLOOR_HEIGHT] = float(user_input[CONF_FLOOR_HEIGHT])
             new_options[CONF_GRID_RESOLUTION] = float(user_input[CONF_GRID_RESOLUTION])
@@ -345,12 +353,16 @@ class RFPresenceOptionsFlow(config_entries.OptionsFlow):
                 ),
                 vol.Required(
                     CONF_UPDATE_INTERVAL,
-                    default=float(
-                        cfg.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
+                    default=max(
+                        MIN_UPDATE_INTERVAL,
+                        float(cfg.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)),
                     ),
                 ): selector.NumberSelector(
                     selector.NumberSelectorConfig(
-                        min=0.5, max=10.0, step=0.5, unit_of_measurement="s"
+                        min=MIN_UPDATE_INTERVAL,
+                        max=30.0,
+                        step=0.5,
+                        unit_of_measurement="s",
                     )
                 ),
                 vol.Required(

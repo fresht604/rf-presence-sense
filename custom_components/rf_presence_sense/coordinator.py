@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Callable
 from datetime import timedelta
 import logging
@@ -15,6 +16,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
+    BUS_EVENT_MAX_PER_WINDOW,
+    BUS_EVENT_WINDOW_SECONDS,
     CONF_ACTIVE_POLL_ENTITIES,
     CONF_AWAY_ENTITY,
     CONF_CALIBRATION_DURATION,
@@ -46,7 +49,9 @@ from .const import (
     MAX_REPORTED_FINGERPRINTS,
     MAX_REPORTED_HEATMAP_PEAKS,
     MAX_REPORTED_PERTURBATIONS,
+    MIN_UPDATE_INTERVAL,
     PROTOCOL_BLE,
+    ROOM_CHANGE_CONFIRM_TICKS,
     TARGET_TYPE_ANIMAL,
     TARGET_TYPE_HUMAN,
 )
@@ -129,7 +134,8 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.away_entity = str(cfg.get(CONF_AWAY_ENTITY, "") or "").strip()
         update_interval = max(
-            0.5, float(cfg.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL))
+            MIN_UPDATE_INTERVAL,
+            float(cfg.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)),
         )
 
         super().__init__(
@@ -185,6 +191,7 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._edge_walk_task: asyncio.Task[None] | None = None
         self._edge_walk_state: dict[str, Any] | None = None
         self._shutdown = False
+        self._reconstructing = False
         self._last_update_ts = time.monotonic()
         self._recon_seq: int = 0
         self.last_reconstruction: RTIReconstruction | None = None
@@ -194,6 +201,8 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._room_listeners: list[Callable[[], None]] = []
         self._save_tasks: set[asyncio.Task[Any]] = set()
         self._prev_targets_by_id: dict[int, tuple[str, str | None, str | None]] = {}
+        self._pending_room_changes: dict[int, tuple[str | None, str | None, int]] = {}
+        self._event_timestamps: deque[float] = deque(maxlen=BUS_EVENT_MAX_PER_WINDOW)
 
         self.collector = SignalCollector(
             hass=hass,
@@ -371,6 +380,7 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     polygon=polygon,
                     open_edges=list(item.get("open_edges") or item.get("oe") or []),
                     doors=list(item.get("doors") or item.get("dr") or []),
+                    windows=list(item.get("windows") or item.get("wn") or []),
                 )
             )
         return rooms or [
@@ -518,6 +528,7 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 existing_link.p1 = new_p1
                                 existing_link.p2 = new_p2
                                 self.engine._dirty_geometry = True
+                                self.engine._force_rebuild = True
                                 self.engine._geometry_version += 1
         self.engine.clear_links_except(valid_link_ids)
 
@@ -589,7 +600,7 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     float(recv["x"]), float(recv["y"]), float(recv.get("z", 1.0))
                 ),
             )
-            if self.engine.add_or_update_link(link):
+            if self.engine.add_or_update_link(link, dynamic=True):
                 self.engine.ingest_sample(
                     link_id,
                     rssi_dbm,
@@ -721,8 +732,9 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         polygon: list[tuple[float, float]] | list[list[float]] | None = None,
         open_edges: list[str] | None = None,
         doors: list[dict[str, Any]] | None = None,
+        windows: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Add or update a rectangular or polygon room zone (with optional doors & passages)."""
+        """Add or update a rectangular or polygon room zone (with optional doors, windows & passages)."""
         poly_pts: list[tuple[float, float]] | None = None
         if polygon is not None and len(polygon) >= 3:
             poly_pts = [
@@ -746,6 +758,7 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 polygon=poly_pts,
                 open_edges=list(open_edges or []),
                 doors=list(doors or []),
+                windows=list(windows or []),
             )
         )
         self.tracker.set_rooms(self.rooms)
@@ -765,6 +778,7 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         polygon: list[tuple[float, float]] | list[list[float]] | None = None,
         open_edges: list[str] | None = None,
         doors: list[dict[str, Any]] | None = None,
+        windows: list[dict[str, Any]] | None = None,
     ) -> None:
         """Add or update a room zone and persist immediately."""
         poly_pts: list[tuple[float, float]] | None = None
@@ -790,6 +804,7 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 polygon=poly_pts,
                 open_edges=list(open_edges or []),
                 doors=list(doors or []),
+                windows=list(windows or []),
             )
         )
         self.tracker.set_rooms(self.rooms)
@@ -1106,7 +1121,27 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 grouped.setdefault(target_room, []).append(("device", did, dname))
                 matched_devices += 1
 
-        # Place grouped devices & receivers neatly inside each room's perimeter (clamped)
+        # Place grouped devices & receivers neatly inside each room (window-aware + floor-aware, strictly clamped)
+        window_keywords = (
+            "rollo",
+            "rolllade",
+            "jalousie",
+            "shutter",
+            "blind",
+            "fenster",
+            "window",
+            "sbdw",
+            "balkon",
+        )
+        floor_keywords = (
+            "leiste",
+            "plug",
+            "pstrip",
+            "steckdose",
+            "socket",
+            "powerstrip",
+        )
+
         for room_id, items in grouped.items():
             room = room_map[room_id]
             rx_min = max(0.0, min(self.floor_width, room.x_min))
@@ -1115,9 +1150,6 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ry_max = max(ry_min, min(self.floor_height, room.y_max))
             rw = max(0.2, rx_max - rx_min)
             rh = max(0.2, ry_max - ry_min)
-            pts = _auto_perimeter_positions(
-                len(items), rw, rh, x_offset=rx_min, y_offset=ry_min
-            )
             poly_cx = (
                 sum(p[0] for p in room.polygon) / len(room.polygon)
                 if room.polygon
@@ -1128,25 +1160,78 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if room.polygon
                 else 0.5 * (ry_min + ry_max)
             )
-            for (kind, item_id, label), (raw_px, raw_py, _default_z) in zip(items, pts):
-                px = round(max(rx_min, min(rx_max, raw_px)), 2)
-                py = round(max(ry_min, min(ry_max, raw_py)), 2)
+
+            def _clamp_in_room(raw_x: float, raw_y: float) -> tuple[float, float]:
+                px = round(max(rx_min, min(rx_max, raw_x)), 2)
+                py = round(max(ry_min, min(ry_max, raw_y)), 2)
                 if room.polygon and not room.contains(px, py):
-                    # Pull toward polygon centroid until inside the polygon
                     for alpha in (0.35, 0.65, 0.9, 1.0):
                         tx = round(px + alpha * (poly_cx - px), 2)
                         ty = round(py + alpha * (poly_cy - py), 2)
                         if room.contains(tx, ty):
-                            px, py = tx, ty
-                            break
+                            return (tx, ty)
+                return (px, py)
+
+            window_items: list[tuple[str, str, str]] = []
+            regular_items: list[tuple[str, str, str]] = []
+            for entry_item in items:
+                _k, _id, _lbl = entry_item
+                low_txt = f"{_lbl} {_id}".lower()
+                if room.windows and any(kw in low_txt for kw in window_keywords):
+                    window_items.append(entry_item)
+                else:
+                    regular_items.append(entry_item)
+
+            # Place Rollo / Fenster / SBDW devices near the room's window edge(s) at z=1.6m
+            win_inset = min(0.25, rw * 0.15, rh * 0.15)
+            for w_idx, (kind, item_id, label) in enumerate(window_items):
+                win = room.windows[w_idx % len(room.windows)]
+                edge = str(win.get("edge", "north"))
+                pos = float(win.get("pos", 0.5))
+                # Slight spread along window if multiple devices share the same window
+                same_slot = w_idx // len(room.windows)
+                spread = ((same_slot % 3) - 1) * 0.12 if same_slot > 0 else 0.0
+                t = max(0.08, min(0.92, pos + spread))
+                if edge == "north":
+                    raw_px, raw_py = rx_min + t * rw, ry_min + win_inset
+                elif edge == "south":
+                    raw_px, raw_py = rx_min + t * rw, ry_max - win_inset
+                elif edge == "west":
+                    raw_px, raw_py = rx_min + win_inset, ry_min + t * rh
+                else:  # east
+                    raw_px, raw_py = rx_max - win_inset, ry_min + t * rh
+                px, py = _clamp_in_room(raw_px, raw_py)
+                z = 1.6
                 if kind == "receiver":
-                    z = infer_height_from_name(label, is_receiver=True)
                     self.receivers[item_id]["x"] = px
                     self.receivers[item_id]["y"] = py
                     self.receivers[item_id]["z"] = z
                 else:
+                    self.devices[item_id]["x"] = px
+                    self.devices[item_id]["y"] = py
+                    self.devices[item_id]["z"] = z
+
+            # Place remaining items cleanly along room perimeter
+            pts = _auto_perimeter_positions(
+                len(regular_items), rw, rh, x_offset=rx_min, y_offset=ry_min
+            )
+            for (kind, item_id, label), (raw_px, raw_py, _default_z) in zip(
+                regular_items, pts
+            ):
+                px, py = _clamp_in_room(raw_px, raw_py)
+                low_txt = f"{label} {item_id}".lower()
+                if any(kw in low_txt for kw in floor_keywords):
+                    z = 0.35
+                elif kind == "receiver":
+                    z = infer_height_from_name(label, is_receiver=True)
+                else:
                     proto = str(self.devices[item_id].get("protocol", "wifi"))
                     z = infer_height_from_name(label, protocol=proto, is_receiver=False)
+                if kind == "receiver":
+                    self.receivers[item_id]["x"] = px
+                    self.receivers[item_id]["y"] = py
+                    self.receivers[item_id]["z"] = z
+                else:
                     self.devices[item_id]["x"] = px
                     self.devices[item_id]["y"] = py
                     self.devices[item_id]["z"] = z
@@ -1162,68 +1247,117 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "rooms_populated": len(grouped),
         }
 
-    def _fire_target_events(self, targets: list[TrackedTarget]) -> None:
-        """Emit Home Assistant bus events on target detection, room change, and loss."""
+    def _can_fire_bus_event(self, now: float) -> bool:
+        """Enforce global HA bus event rate limit (max BUS_EVENT_MAX_PER_WINDOW / 60s)."""
+        if (
+            len(self._event_timestamps) >= BUS_EVENT_MAX_PER_WINDOW
+            and (now - self._event_timestamps[0]) < BUS_EVENT_WINDOW_SECONDS
+        ):
+            return False
+        self._event_timestamps.append(now)
+        return True
+
+    def _fire_target_events(
+        self, targets: list[TrackedTarget], now: float | None = None
+    ) -> None:
+        """Emit throttled & debounced Home Assistant bus events on target transitions."""
         bus = getattr(self.hass, "bus", None)
         if bus is None or not hasattr(bus, "async_fire"):
             return
 
+        ts = time.monotonic() if now is None else now
         current_by_id: dict[int, TrackedTarget] = {t.track_id: t for t in targets}
+        next_prev: dict[int, tuple[str, str | None, str | None]] = {}
 
-        # 1. Newly detected or room-changed targets
+        # 1. Newly detected or debounced room-changed targets
         for tid, target in current_by_id.items():
             prev = self._prev_targets_by_id.get(tid)
             if prev is None:
-                bus.async_fire(
-                    EVENT_TARGET_DETECTED,
-                    {
-                        "entry_id": self.entry.entry_id,
-                        "track_id": tid,
-                        "type": target.target_type,
-                        "room_id": target.room_id,
-                        "room": target.room_name or "Unbekannt",
-                        "x": round(target.x, 2),
-                        "y": round(target.y, 2),
-                        "confidence": round(target.confidence, 2),
-                    },
-                )
-            else:
-                _, prev_room_id, prev_room_name = prev
-                if target.room_id != prev_room_id:
+                self._pending_room_changes.pop(tid, None)
+                if self._can_fire_bus_event(ts):
                     bus.async_fire(
-                        EVENT_ROOM_CHANGED,
+                        EVENT_TARGET_DETECTED,
                         {
                             "entry_id": self.entry.entry_id,
                             "track_id": tid,
                             "type": target.target_type,
-                            "from_room_id": prev_room_id,
-                            "from_room": prev_room_name or "Unbekannt",
-                            "to_room_id": target.room_id,
-                            "to_room": target.room_name or "Unbekannt",
+                            "room_id": target.room_id,
+                            "room": target.room_name or "Unbekannt",
                             "x": round(target.x, 2),
                             "y": round(target.y, 2),
                             "confidence": round(target.confidence, 2),
                         },
                     )
+                next_prev[tid] = (target.target_type, target.room_id, target.room_name)
+            else:
+                _, prev_room_id, prev_room_name = prev
+                if target.room_id != prev_room_id:
+                    pending = self._pending_room_changes.get(tid)
+                    if pending is not None and pending[0] == target.room_id:
+                        confirm_count = pending[2] + 1
+                    else:
+                        confirm_count = 1
+
+                    if confirm_count >= ROOM_CHANGE_CONFIRM_TICKS:
+                        self._pending_room_changes.pop(tid, None)
+                        if self._can_fire_bus_event(ts):
+                            bus.async_fire(
+                                EVENT_ROOM_CHANGED,
+                                {
+                                    "entry_id": self.entry.entry_id,
+                                    "track_id": tid,
+                                    "type": target.target_type,
+                                    "from_room_id": prev_room_id,
+                                    "from_room": prev_room_name or "Unbekannt",
+                                    "to_room_id": target.room_id,
+                                    "to_room": target.room_name or "Unbekannt",
+                                    "x": round(target.x, 2),
+                                    "y": round(target.y, 2),
+                                    "confidence": round(target.confidence, 2),
+                                },
+                            )
+                        next_prev[tid] = (
+                            target.target_type,
+                            target.room_id,
+                            target.room_name,
+                        )
+                    else:
+                        self._pending_room_changes[tid] = (
+                            target.room_id,
+                            target.room_name,
+                            confirm_count,
+                        )
+                        # Keep confirmed previous room until debounce threshold is met
+                        next_prev[tid] = (
+                            target.target_type,
+                            prev_room_id,
+                            prev_room_name,
+                        )
+                else:
+                    self._pending_room_changes.pop(tid, None)
+                    next_prev[tid] = (
+                        target.target_type,
+                        target.room_id,
+                        target.room_name,
+                    )
 
         # 2. Lost targets
         for prev_tid, (prev_type, prev_room_id, prev_room_name) in self._prev_targets_by_id.items():
             if prev_tid not in current_by_id:
-                bus.async_fire(
-                    EVENT_TARGET_LOST,
-                    {
-                        "entry_id": self.entry.entry_id,
-                        "track_id": prev_tid,
-                        "type": prev_type,
-                        "last_room_id": prev_room_id,
-                        "last_room": prev_room_name or "Unbekannt",
-                    },
-                )
+                self._pending_room_changes.pop(prev_tid, None)
+                if self._can_fire_bus_event(ts):
+                    bus.async_fire(
+                        EVENT_TARGET_LOST,
+                        {
+                            "entry_id": self.entry.entry_id,
+                            "track_id": prev_tid,
+                            "type": prev_type,
+                            "last_room_id": prev_room_id,
+                            "last_room": prev_room_name or "Unbekannt",
+                        },
+                    )
 
-        self._prev_targets_by_id = {
-            tid: (t.target_type, t.room_id, t.room_name)
-            for tid, t in current_by_id.items()
-        }
+        self._prev_targets_by_id = next_prev
 
     def _extract_compact_heatmap_peaks(
         self, recon: RTIReconstruction
@@ -1246,156 +1380,164 @@ class RFPresenceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Run RTI reconstruction in executor and target tracking on each tick."""
-        now = time.monotonic()
-        dt = max(0.2, now - self._last_update_ts)
-        self._last_update_ts = now
+        if self._reconstructing:
+            _LOGGER.debug("Skipping overlapping RTI reconstruction tick")
+            return self.data or {}
 
-        # Optional active polling for slow Wi-Fi RSSI entities
-        if self._active_poll_entities:
-            try:
-                await self.hass.services.async_call(
-                    "homeassistant",
-                    "update_entity",
-                    {"entity_id": self._active_poll_entities},
-                    blocking=False,
-                )
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("Active entity poll skipped: %s", err)
+        self._reconstructing = True
+        try:
+            now = time.monotonic()
+            dt = max(0.2, now - self._last_update_ts)
+            self._last_update_ts = now
 
-        # Offload CPU-bound RTI projection rebuild & reconstruction off the event loop
-        recon: RTIReconstruction = await self.hass.async_add_executor_job(
-            self.engine.reconstruct, now
-        )
-        self.last_reconstruction = recon
+            # Optional active polling for slow Wi-Fi RSSI entities
+            if self._active_poll_entities:
+                try:
+                    await self.hass.services.async_call(
+                        "homeassistant",
+                        "update_entity",
+                        {"entity_id": self._active_poll_entities},
+                        blocking=False,
+                    )
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.debug("Active entity poll skipped: %s", err)
 
-        if self._calibrating:
-            targets: list[TrackedTarget] = []
-        else:
-            targets = self.tracker.update(recon, dt=dt)
-            self._fire_target_events(targets)
-        self.last_targets = targets
-        self._recon_seq += 1
-
-        humans = [t for t in targets if t.target_type == TARGET_TYPE_HUMAN]
-        animals = [t for t in targets if t.target_type == TARGET_TYPE_ANIMAL]
-
-        room_summary: dict[str, dict[str, Any]] = {}
-        for room in self.rooms:
-            r_targets = [t for t in targets if t.room_id == room.room_id]
-            r_humans = [t for t in r_targets if t.target_type == TARGET_TYPE_HUMAN]
-            r_animals = [t for t in r_targets if t.target_type == TARGET_TYPE_ANIMAL]
-            room_summary[room.room_id] = {
-                "name": room.name,
-                "occupied": len(r_targets) > 0,
-                "human_detected": len(r_humans) > 0,
-                "animal_detected": len(r_animals) > 0,
-                "humans": len(r_humans),
-                "animals": len(r_animals),
-                "targets": [t.to_dict() for t in r_targets],
-            }
-
-        link_health_pct = (
-            round(100.0 * recon.active_links / recon.total_links, 1)
-            if recon.total_links > 0
-            else 0.0
-        )
-
-        # Report only actively perturbed links (Top-N) to keep HA state objects compact
-        top_perturbations = dict(
-            sorted(
-                (
-                    (lid, val)
-                    for lid, val in recon.link_perturbations.items()
-                    if val > 0.1
-                ),
-                key=lambda item: item[1],
-                reverse=True,
-            )[:MAX_REPORTED_PERTURBATIONS]
-        )
-
-        # Compact 3D scene payload for the interactive 3D Lovelace Card (all unrecorded,
-        # engineered to stay strictly under 16 KB even at MAX_LINKS=80 + 16 targets!)
-        devices_3d: list[list[Any]] = []
-        dev_idx_map: dict[str, int] = {}
-        for did, dev in list(self.devices.items())[:MAX_LINKS]:
-            dev_idx_map[did] = len(devices_3d)
-            raw_name = str(dev.get("name", did))[:16]
-            devices_3d.append(
-                [
-                    did,
-                    "" if raw_name == did else raw_name,
-                    "b" if dev.get("protocol") == PROTOCOL_BLE else "w",
-                    round(float(dev.get("x", 0.0)), 2),
-                    round(float(dev.get("y", 0.0)), 2),
-                    round(float(dev.get("z", 1.0)), 2),
-                ]
+            # Offload CPU-bound RTI projection rebuild & reconstruction off the event loop
+            recon: RTIReconstruction = await self.hass.async_add_executor_job(
+                self.engine.reconstruct, now
             )
+            self.last_reconstruction = recon
 
-        receivers_3d: list[dict[str, Any]] = []
-        recv_idx_map: dict[str, int] = {}
-        for rid, recv in list(self.receivers.items())[:MAX_LINKS]:
-            recv_idx_map[rid] = len(receivers_3d)
-            receivers_3d.append(
-                {
-                    "id": rid,
-                    "name": str(recv.get("name", rid))[:24],
-                    "x": round(float(recv.get("x", 0.0)), 2),
-                    "y": round(float(recv.get("y", 0.0)), 2),
-                    "z": round(float(recv.get("z", 1.1)), 2),
-                }
-            )
-
-        active_links_3d: list[Any] = []
-        for lid, proto, x1, y1, z1, x2, y2, z2 in self.engine.snapshot_links_3d():
-            pert = round(recon.link_perturbations.get(lid, 0.0), 2)
-            p_code = "b" if proto == PROTOCOL_BLE else "w"
-            d_part, _, r_part = lid.partition("->")
-            di = dev_idx_map.get(d_part)
-            ri = recv_idx_map.get(r_part)
-            if di is not None and ri is not None:
-                entry_link: list[Any] = (
-                    [di, ri, p_code, pert] if pert > 0.1 else [di, ri, p_code]
-                )
-                active_links_3d.append(entry_link)
+            if self._calibrating:
+                targets: list[TrackedTarget] = []
             else:
-                active_links_3d.append(
+                targets = self.tracker.update(recon, dt=dt)
+                self._fire_target_events(targets, now=now)
+            self.last_targets = targets
+            self._recon_seq += 1
+
+            humans = [t for t in targets if t.target_type == TARGET_TYPE_HUMAN]
+            animals = [t for t in targets if t.target_type == TARGET_TYPE_ANIMAL]
+
+            room_summary: dict[str, dict[str, Any]] = {}
+            for room in self.rooms:
+                r_targets = [t for t in targets if t.room_id == room.room_id]
+                r_humans = [t for t in r_targets if t.target_type == TARGET_TYPE_HUMAN]
+                r_animals = [t for t in r_targets if t.target_type == TARGET_TYPE_ANIMAL]
+                room_summary[room.room_id] = {
+                    "name": room.name,
+                    "occupied": len(r_targets) > 0,
+                    "human_detected": len(r_humans) > 0,
+                    "animal_detected": len(r_animals) > 0,
+                    "humans": len(r_humans),
+                    "animals": len(r_animals),
+                    "targets": [t.to_dict() for t in r_targets],
+                }
+
+            link_health_pct = (
+                round(100.0 * recon.active_links / recon.total_links, 1)
+                if recon.total_links > 0
+                else 0.0
+            )
+
+            # Report only actively perturbed links (Top-N) to keep HA state objects compact
+            top_perturbations = dict(
+                sorted(
+                    (
+                        (lid, val)
+                        for lid, val in recon.link_perturbations.items()
+                        if val > 0.1
+                    ),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:MAX_REPORTED_PERTURBATIONS]
+            )
+
+            # Compact 3D scene payload for the interactive 3D Lovelace Card (all unrecorded,
+            # engineered to stay strictly under 16 KB even at MAX_LINKS=80 + 16 targets!)
+            devices_3d: list[list[Any]] = []
+            dev_idx_map: dict[str, int] = {}
+            for did, dev in list(self.devices.items())[:MAX_LINKS]:
+                dev_idx_map[did] = len(devices_3d)
+                raw_name = str(dev.get("name", did))[:16]
+                devices_3d.append(
+                    [
+                        did,
+                        "" if raw_name == did else raw_name,
+                        "b" if dev.get("protocol") == PROTOCOL_BLE else "w",
+                        round(float(dev.get("x", 0.0)), 2),
+                        round(float(dev.get("y", 0.0)), 2),
+                        round(float(dev.get("z", 1.0)), 2),
+                    ]
+                )
+
+            receivers_3d: list[dict[str, Any]] = []
+            recv_idx_map: dict[str, int] = {}
+            for rid, recv in list(self.receivers.items())[:MAX_LINKS]:
+                recv_idx_map[rid] = len(receivers_3d)
+                receivers_3d.append(
                     {
-                        "id": lid,
-                        "p": proto,
-                        "p1": [round(x1, 2), round(y1, 2), round(z1, 2)],
-                        "p2": [round(x2, 2), round(y2, 2), round(z2, 2)],
-                        "pert": pert,
+                        "id": rid,
+                        "name": str(recv.get("name", rid))[:24],
+                        "x": round(float(recv.get("x", 0.0)), 2),
+                        "y": round(float(recv.get("y", 0.0)), 2),
+                        "z": round(float(recv.get("z", 1.1)), 2),
                     }
                 )
 
-        return {
-            "calibrating": self._calibrating,
-            "humans_count": len(humans),
-            "animals_count": len(animals),
-            "total_targets": len(targets),
-            "targets": [t.to_dict() for t in targets],
-            "rooms": room_summary,
-            "rooms_geometry": [r.to_dict() for r in self.rooms],
-            "devices": devices_3d,
-            "receivers": receivers_3d,
-            "active_links_3d": active_links_3d,
-            "heatmap_peaks": self._extract_compact_heatmap_peaks(recon),
-            "active_links": recon.active_links,
-            "total_links": recon.total_links,
-            "link_health_pct": link_health_pct,
-            "packets_received": self.collector.packet_count,
-            "link_perturbations": top_perturbations,
-            "geometry": self.engine.get_geometry_summary(),
-            "sensitivity": self.sensitivity,
-            "calibration_duration": self.calibration_duration,
-            "presence_aware_baseline": self.presence_aware_baseline,
-            "mask_outside_rooms": self.mask_outside_rooms,
-            "fingerprint_count": self.engine.fingerprint_count,
-            "edge_walk_active": self._edge_walk_state is not None,
-            "fingerprints_xy": self.engine.snapshot_fingerprints_xy(
-                limit=MAX_REPORTED_FINGERPRINTS
-            ),
-        }
+            active_links_3d: list[Any] = []
+            for lid, proto, x1, y1, z1, x2, y2, z2 in self.engine.snapshot_links_3d():
+                pert = round(recon.link_perturbations.get(lid, 0.0), 2)
+                p_code = "b" if proto == PROTOCOL_BLE else "w"
+                d_part, _, r_part = lid.partition("->")
+                di = dev_idx_map.get(d_part)
+                ri = recv_idx_map.get(r_part)
+                if di is not None and ri is not None:
+                    entry_link: list[Any] = (
+                        [di, ri, p_code, pert] if pert > 0.1 else [di, ri, p_code]
+                    )
+                    active_links_3d.append(entry_link)
+                else:
+                    active_links_3d.append(
+                        {
+                            "id": lid,
+                            "p": proto,
+                            "p1": [round(x1, 2), round(y1, 2), round(z1, 2)],
+                            "p2": [round(x2, 2), round(y2, 2), round(z2, 2)],
+                            "pert": pert,
+                        }
+                    )
+
+            return {
+                "calibrating": self._calibrating,
+                "humans_count": len(humans),
+                "animals_count": len(animals),
+                "total_targets": len(targets),
+                "targets": [t.to_dict() for t in targets],
+                "rooms": room_summary,
+                "rooms_geometry": [r.to_dict() for r in self.rooms],
+                "devices": devices_3d,
+                "receivers": receivers_3d,
+                "active_links_3d": active_links_3d,
+                "heatmap_peaks": self._extract_compact_heatmap_peaks(recon),
+                "active_links": recon.active_links,
+                "total_links": recon.total_links,
+                "link_health_pct": link_health_pct,
+                "packets_received": self.collector.packet_count,
+                "link_perturbations": top_perturbations,
+                "geometry": self.engine.get_geometry_summary(),
+                "sensitivity": self.sensitivity,
+                "calibration_duration": self.calibration_duration,
+                "presence_aware_baseline": self.presence_aware_baseline,
+                "mask_outside_rooms": self.mask_outside_rooms,
+                "fingerprint_count": self.engine.fingerprint_count,
+                "edge_walk_active": self._edge_walk_state is not None,
+                "fingerprints_xy": self.engine.snapshot_fingerprints_xy(
+                    limit=MAX_REPORTED_FINGERPRINTS
+                ),
+            }
+        finally:
+            self._reconstructing = False
 
     def async_shutdown_collector(self) -> None:
         """Stop all signal collector subscriptions, room listeners, and cancel background tasks."""

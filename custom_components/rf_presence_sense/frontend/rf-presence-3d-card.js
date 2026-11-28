@@ -1,5 +1,5 @@
 /**
- * RF Presence Sense — Interactive 3D Sidebar Panel & Custom Lovelace Card (v2.1.0)
+ * RF Presence Sense — Interactive 3D Sidebar Panel & Custom Lovelace Card (v2.2.0)
  * Pure Vanilla JS + HTML5 3D Canvas (zero external dependencies, 0% idle CPU).
  *
  * Exports two Web Components:
@@ -21,9 +21,9 @@ class RFPresence3DCard extends HTMLElement {
     this._config = {};
     this._hass = null;
 
-    // 3D CAD Camera state (radians, zoom, screen pan)
-    this._yaw = (38 * Math.PI) / 180;
-    this._pitch = (34 * Math.PI) / 180;
+    // 3D CAD Camera state (radians, zoom, screen pan) — South-Front default view
+    this._yaw = (-20 * Math.PI) / 180;
+    this._pitch = (38 * Math.PI) / 180;
     this._zoom = 1.0;
     this._panX = 0;
     this._panY = 0;
@@ -288,7 +288,23 @@ class RFPresence3DCard extends HTMLElement {
           return null;
         })
         .filter(Boolean);
-      return { ...base, open_edges, doors };
+      const rawWn = base.windows || base.wn || [];
+      const windows = rawWn
+        .map((w) => {
+          if (Array.isArray(w) && w.length >= 3) {
+            return { edge: _normEdge(w[0]), pos: Number(w[1]), width: Number(w[2]) };
+          }
+          if (w && typeof w === "object" && (w.edge || w.e)) {
+            return {
+              edge: _normEdge(w.edge || w.e),
+              pos: Number(w.pos ?? w.p ?? 0.5),
+              width: Number(w.width ?? w.w ?? 1.4),
+            };
+          }
+          return null;
+        })
+        .filter(Boolean);
+      return { ...base, open_edges, doors, windows };
     });
   }
 
@@ -781,8 +797,8 @@ class RFPresence3DCard extends HTMLElement {
     this._velYaw = 0;
     this._velPitch = 0;
     if (preset === "orbit") {
-      this._yaw = (38 * Math.PI) / 180;
-      this._pitch = (34 * Math.PI) / 180;
+      this._yaw = (-20 * Math.PI) / 180;
+      this._pitch = (38 * Math.PI) / 180;
     } else if (preset === "iso") {
       this._yaw = (45 * Math.PI) / 180;
       this._pitch = (35.26 * Math.PI) / 180;
@@ -790,8 +806,8 @@ class RFPresence3DCard extends HTMLElement {
       this._yaw = 0;
       this._pitch = (88 * Math.PI) / 180;
     } else {
-      this._yaw = (38 * Math.PI) / 180;
-      this._pitch = (34 * Math.PI) / 180;
+      this._yaw = (-20 * Math.PI) / 180;
+      this._pitch = (38 * Math.PI) / 180;
       this._zoom = 1.0;
       this._panX = 0;
       this._panY = 0;
@@ -972,6 +988,9 @@ class RFPresence3DCard extends HTMLElement {
       };
       if (existingRoom && Array.isArray(existingRoom.doors) && existingRoom.doors.length) {
         serviceData.doors = existingRoom.doors;
+      }
+      if (existingRoom && Array.isArray(existingRoom.windows) && existingRoom.windows.length) {
+        serviceData.windows = existingRoom.windows;
       }
 
       this._hass.callService("rf_presence_sense", "define_room", serviceData);
@@ -1388,6 +1407,8 @@ class RFPresence3DCard extends HTMLElement {
     ];
     const wallH = 2.4;
     const doorH = 2.05;
+    const winBot = 0.9;
+    const winTop = 2.1;
     const slabD = -0.18;
 
     // 1. Subtle outer bounding frame (floorplan_image projected if configured)
@@ -1507,11 +1528,15 @@ class RFPresence3DCard extends HTMLElement {
       }
       ctx.restore();
 
-      // Queue 3D translucent wall panels (with open_edges & door cutouts!) for depth sorting
+      // Queue 3D translucent wall panels (with open_edges, door & window cutouts!) for depth sorting
       const openSet = new Set(rm.open_edges || []);
       const doorsByEdge = {};
       for (const dr of rm.doors || []) {
         (doorsByEdge[dr.edge] = doorsByEdge[dr.edge] || []).push(dr);
+      }
+      const windowsByEdge = {};
+      for (const wn of rm.windows || []) {
+        (windowsByEdge[wn.edge] = windowsByEdge[wn.edge] || []).push(wn);
       }
 
       for (let i = 0; i < verts.length; i++) {
@@ -1539,6 +1564,7 @@ class RFPresence3DCard extends HTMLElement {
           y1,
           col,
           doors: (edgeName && doorsByEdge[edgeName]) || [],
+          windows: (edgeName && windowsByEdge[edgeName]) || [],
         });
       }
 
@@ -1685,17 +1711,21 @@ class RFPresence3DCard extends HTMLElement {
         const wp = obj.item;
         const fill = wp.col + "18";
         const stroke = wp.col + "66";
-        if (!wp.doors.length) {
+        const openings = [
+          ...(wp.doors || []).map((d) => ({ ...d, kind: "door" })),
+          ...(wp.windows || []).map((w) => ({ ...w, kind: "window" })),
+        ].sort((a, b) => a.pos - b.pos);
+
+        if (!openings.length) {
           this._drawWallQuad(ctx, P, wp.x0, wp.y0, wp.x1, wp.y1, 0, wallH, fill, stroke);
         } else {
-          // Split wall horizontally around door cutouts + render top lintel & golden doorframe
+          // Split wall horizontally around door & window cutouts
           const len = Math.max(0.1, Math.hypot(wp.x1 - wp.x0, wp.y1 - wp.y0));
-          const sortedDoors = [...wp.doors].sort((a, b) => a.pos - b.pos);
           let cursor = 0;
-          for (const dr of sortedDoors) {
-            const half = Math.min(0.45, (dr.width / len) * 0.5);
-            const tA = Math.max(cursor, dr.pos - half);
-            const tB = Math.min(1, dr.pos + half);
+          for (const op of openings) {
+            const half = Math.min(0.45, (op.width / len) * 0.5);
+            const tA = Math.max(cursor, op.pos - half);
+            const tB = Math.min(1, op.pos + half);
             if (tA > cursor + 0.01) {
               this._drawWallQuad(
                 ctx,
@@ -1714,21 +1744,63 @@ class RFPresence3DCard extends HTMLElement {
             const dy0 = wp.y0 + tA * (wp.y1 - wp.y0);
             const dx1 = wp.x0 + tB * (wp.x1 - wp.x0);
             const dy1 = wp.y0 + tB * (wp.y1 - wp.y0);
-            // Wall lintel above door (doorH .. wallH)
-            this._drawWallQuad(ctx, P, dx0, dy0, dx1, dy1, doorH, wallH, fill, stroke);
-            // Golden 3D doorframe
-            const da0 = P(dx0, dy0, 0);
-            const da1 = P(dx0, dy0, doorH);
-            const db0 = P(dx1, dy1, 0);
-            const db1 = P(dx1, dy1, doorH);
-            ctx.strokeStyle = "#fde047";
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.moveTo(da0.x, da0.y);
-            ctx.lineTo(da1.x, da1.y);
-            ctx.lineTo(db1.x, db1.y);
-            ctx.lineTo(db0.x, db0.y);
-            ctx.stroke();
+
+            if (op.kind === "door") {
+              // Wall lintel above door (doorH .. wallH)
+              this._drawWallQuad(ctx, P, dx0, dy0, dx1, dy1, doorH, wallH, fill, stroke);
+              // Golden 3D doorframe (z = 0 .. 2.05m)
+              const da0 = P(dx0, dy0, 0);
+              const da1 = P(dx0, dy0, doorH);
+              const db0 = P(dx1, dy1, 0);
+              const db1 = P(dx1, dy1, doorH);
+              ctx.strokeStyle = "#fde047";
+              ctx.lineWidth = 2;
+              ctx.beginPath();
+              ctx.moveTo(da0.x, da0.y);
+              ctx.lineTo(da1.x, da1.y);
+              ctx.lineTo(db1.x, db1.y);
+              ctx.lineTo(db0.x, db0.y);
+              ctx.stroke();
+            } else {
+              // Wall sill below window (0 .. winBot) and lintel above (winTop .. wallH)
+              this._drawWallQuad(ctx, P, dx0, dy0, dx1, dy1, 0, winBot, fill, stroke);
+              this._drawWallQuad(ctx, P, dx0, dy0, dx1, dy1, winTop, wallH, fill, stroke);
+              // Light-blue/cyan 3D glass window pane & frame (z = 0.9 .. 2.1m)
+              this._drawWallQuad(
+                ctx,
+                P,
+                dx0,
+                dy0,
+                dx1,
+                dy1,
+                winBot,
+                winTop,
+                "rgba(56, 189, 248, 0.26)",
+                "#7dd3fc"
+              );
+              const wa0 = P(dx0, dy0, winBot);
+              const wa1 = P(dx0, dy0, winTop);
+              const wb0 = P(dx1, dy1, winBot);
+              const wb1 = P(dx1, dy1, winTop);
+              const wm0 = P((dx0 + dx1) * 0.5, (dy0 + dy1) * 0.5, winBot);
+              const wm1 = P((dx0 + dx1) * 0.5, (dy0 + dy1) * 0.5, winTop);
+              ctx.strokeStyle = "#7dd3fc";
+              ctx.lineWidth = 2;
+              ctx.beginPath();
+              ctx.moveTo(wa0.x, wa0.y);
+              ctx.lineTo(wa1.x, wa1.y);
+              ctx.lineTo(wb1.x, wb1.y);
+              ctx.lineTo(wb0.x, wb0.y);
+              ctx.closePath();
+              ctx.stroke();
+              // Center window mullion for instant visual distinction from doors
+              ctx.strokeStyle = "rgba(186, 230, 253, 0.85)";
+              ctx.lineWidth = 1.2;
+              ctx.beginPath();
+              ctx.moveTo(wm0.x, wm0.y);
+              ctx.lineTo(wm1.x, wm1.y);
+              ctx.stroke();
+            }
             cursor = Math.max(cursor, tB);
           }
           if (cursor < 0.99) {
@@ -1850,14 +1922,34 @@ class RFPresence3DCard extends HTMLElement {
           }
         }
 
-        const hr = (12 + 5 * pulse) * Math.max(0.7, this._zoom * 0.85);
+        const isStationary = t.motion === "stationary";
+        const dwellS = Math.max(0, Number(t.dwell_s) || 0);
+        const slowPulse = 0.5 + 0.5 * Math.sin(performance.now() * 0.0018);
+        const hr = (
+          isStationary ? 13 + 2.2 * slowPulse : 12 + 5 * pulse
+        ) * Math.max(0.7, this._zoom * 0.85);
         ctx.beginPath();
         ctx.ellipse(base.x, base.y, hr, hr * 0.52, 0, 0, Math.PI * 2);
         ctx.fillStyle = isHuman ? "rgba(16,185,129,0.22)" : "rgba(251,146,60,0.24)";
         ctx.fill();
-        ctx.strokeStyle = col;
-        ctx.lineWidth = 1.2;
+        ctx.strokeStyle = isStationary ? hiCol : col;
+        ctx.lineWidth = isStationary ? 1.6 : 1.2;
         ctx.stroke();
+
+        if (isStationary) {
+          // Calm outer breathing ring for stationary / resting presence
+          const outerR = hr * 1.38;
+          ctx.save();
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.ellipse(base.x, base.y, outerR, outerR * 0.52, 0, 0, Math.PI * 2);
+          ctx.strokeStyle = isHuman
+            ? "rgba(110, 231, 183, 0.55)"
+            : "rgba(253, 186, 116, 0.55)";
+          ctx.lineWidth = 1.2;
+          ctx.stroke();
+          ctx.restore();
+        }
 
         let labelY = base.y - 26;
         if (isHuman) {
@@ -1900,12 +1992,21 @@ class RFPresence3DCard extends HTMLElement {
           labelY = dome.y - dry - 8;
         }
 
-        const badge = `${isHuman ? "M" : "T"}${t.id} ${Math.round((t.confidence || 0) * 100)}%`;
+        let badge = `${isHuman ? "M" : "T"}${t.id} ${Math.round((t.confidence || 0) * 100)}%`;
+        if (isStationary) {
+          const dwellTxt =
+            dwellS >= 3600
+              ? `${Math.floor(dwellS / 3600)}h`
+              : dwellS >= 60
+                ? `${Math.floor(dwellS / 60)}m`
+                : `${Math.round(dwellS)}s`;
+          badge += ` • Ruhend ${dwellTxt}`;
+        }
         ctx.font = "600 11px system-ui, sans-serif";
         const tw = ctx.measureText(badge).width + 10;
         ctx.fillStyle = "rgba(15, 23, 42, 0.9)";
         ctx.fillRect(base.x - tw / 2, labelY - 13, tw, 17);
-        ctx.strokeStyle = col;
+        ctx.strokeStyle = isStationary ? hiCol : col;
         ctx.lineWidth = 1;
         ctx.strokeRect(base.x - tw / 2, labelY - 13, tw, 17);
         ctx.fillStyle = "#f8fafc";

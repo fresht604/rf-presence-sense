@@ -194,7 +194,8 @@
         "y_max": { "name": "Y Max (m)" },
         "polygon": { "name": "Polygon Vertices (optional)", "description": "Optional list of [x, y] coordinate pairs for L-shaped or custom rooms." },
         "open_edges": { "name": "Open Passages (optional)", "description": "List of edges without walls: north, south, east, west." },
-        "doors": { "name": "Doors (optional)", "description": "List of doorway objects, e.g. [{edge: south, pos: 0.5, width: 0.9}]." }
+        "doors": { "name": "Doors (optional)", "description": "List of doorway entries with edge (north, south, east, west), pos (0.0 to 1.0), and width in meters." },
+        "windows": { "name": "Windows (optional)", "description": "List of window entries with edge (north, south, east, west), pos (0.0 to 1.0), and width in meters." }
       }
     },
     "delete_room": {

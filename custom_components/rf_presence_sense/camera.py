@@ -373,6 +373,7 @@ class _RoomSnap:
     is_rect: bool = True
     open_edges: tuple[str, ...] = ()
     doors: tuple[tuple[str, float, float], ...] = ()
+    windows: tuple[tuple[str, float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -388,6 +389,8 @@ class _TargetSnap:
     is_human: bool
     confidence: float
     trail: tuple[tuple[float, float], ...]
+    motion_state: str = "moving"
+    dwell_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -454,6 +457,11 @@ def _build_render_snapshot(coordinator: Any) -> _RenderSnapshot:
             for d in (getattr(room, "doors", None) or ())
             if isinstance(d, dict) and "edge" in d
         )
+        raw_wn = tuple(
+            (str(w["edge"]), float(w["pos"]), float(w["width"]))
+            for w in (getattr(room, "windows", None) or ())
+            if isinstance(w, dict) and "edge" in w
+        )
         rooms_list.append(
             _RoomSnap(
                 name=str(room.name),
@@ -463,6 +471,7 @@ def _build_render_snapshot(coordinator: Any) -> _RenderSnapshot:
                 is_rect=is_rect,
                 open_edges=raw_oe,
                 doors=raw_dr,
+                windows=raw_wn,
             )
         )
 
@@ -505,6 +514,8 @@ def _build_render_snapshot(coordinator: Any) -> _RenderSnapshot:
                 == TARGET_TYPE_HUMAN,
                 confidence=float(getattr(target, "confidence", 0.75)),
                 trail=trail_pts,
+                motion_state=str(getattr(target, "motion_state", "moving")),
+                dwell_seconds=float(getattr(target, "dwell_seconds", 0.0)),
             )
         )
 
@@ -656,9 +667,11 @@ def render_heatmap_png_from_snapshot(
         my = proj(fw + 0.35, fh * 0.5, 0.0)
         canvas.draw_text(my[0] - 10, my[1], f"Y:{fh:.0f}M", (148, 163, 184))
 
-    # 3. 3D Room Floors & Translucent 3D Walls with open_edges & doors (z = 0 .. 2.2m)
+    # 3. 3D Room Floors & Translucent 3D Walls with open_edges, doors & windows (z = 0 .. 2.2m)
     wall_h = 2.2
     door_h = 2.0
+    win_bot = 0.9
+    win_top = 2.1
     rect_edge_names = ("north", "east", "south", "west")
     room_palette = [
         (56, 189, 248),
@@ -678,6 +691,9 @@ def render_heatmap_png_from_snapshot(
         doors_by_edge: dict[str, list[tuple[float, float]]] = {}
         for d_edge, d_pos, d_width in room.doors:
             doors_by_edge.setdefault(d_edge, []).append((d_pos, d_width))
+        windows_by_edge: dict[str, list[tuple[float, float]]] = {}
+        for w_edge, w_pos, w_width in room.windows:
+            windows_by_edge.setdefault(w_edge, []).append((w_pos, w_width))
 
         for i in range(nv):
             v0 = room.vertices[i]
@@ -696,7 +712,7 @@ def render_heatmap_png_from_snapshot(
             canvas.draw_line(f0[0], f0[1], c0[0], c0[1], r_col, alpha=0.35, dashed=True)
             canvas.draw_line(c0[0], c0[1], c1[0], c1[1], r_col, alpha=0.30)
 
-            # Door cutouts along this wall edge
+            # Door cutouts along this wall edge (golden frames, z = 0 .. 2.0m)
             if edge_name and edge_name in doors_by_edge:
                 edge_len = max(0.1, math.hypot(v1[0] - v0[0], v1[1] - v0[1]))
                 for d_pos, d_width in doors_by_edge[edge_name]:
@@ -713,6 +729,31 @@ def render_heatmap_png_from_snapshot(
                     canvas.draw_line(da0[0], da0[1], da1[0], da1[1], door_col, alpha=0.85)
                     canvas.draw_line(db0[0], db0[1], db1[0], db1[1], door_col, alpha=0.85)
                     canvas.draw_line(da1[0], da1[1], db1[0], db1[1], door_col, alpha=0.85)
+
+            # Window frames along this wall edge (light-blue/cyan glass, z = 0.9 .. 2.1m)
+            if edge_name and edge_name in windows_by_edge:
+                edge_len = max(0.1, math.hypot(v1[0] - v0[0], v1[1] - v0[1]))
+                for w_pos, w_width in windows_by_edge[edge_name]:
+                    half_t = min(0.45, (w_width / edge_len) * 0.5)
+                    t_a = max(0.02, w_pos - half_t)
+                    t_b = min(0.98, w_pos + half_t)
+                    t_m = 0.5 * (t_a + t_b)
+                    ax = v0[0] + t_a * (v1[0] - v0[0])
+                    ay = v0[1] + t_a * (v1[1] - v0[1])
+                    bx = v0[0] + t_b * (v1[0] - v0[0])
+                    by = v0[1] + t_b * (v1[1] - v0[1])
+                    mx_w = v0[0] + t_m * (v1[0] - v0[0])
+                    my_w = v0[1] + t_m * (v1[1] - v0[1])
+                    wa0, wb0 = proj(ax, ay, win_bot), proj(bx, by, win_bot)
+                    wa1, wb1 = proj(ax, ay, win_top), proj(bx, by, win_top)
+                    wm0, wm1 = proj(mx_w, my_w, win_bot), proj(mx_w, my_w, win_top)
+                    canvas.fill_polygon([wa0, wb0, wb1, wa1], (56, 189, 248), alpha=0.28)
+                    win_col = (125, 211, 252)
+                    canvas.draw_line(wa0[0], wa0[1], wb0[0], wb0[1], win_col, alpha=0.92)
+                    canvas.draw_line(wa1[0], wa1[1], wb1[0], wb1[1], win_col, alpha=0.92)
+                    canvas.draw_line(wa0[0], wa0[1], wa1[0], wa1[1], win_col, alpha=0.92)
+                    canvas.draw_line(wb0[0], wb0[1], wb1[0], wb1[1], win_col, alpha=0.92)
+                    canvas.draw_line(wm0[0], wm0[1], wm1[0], wm1[1], win_col, alpha=0.65)
 
         # Room name label on floor center
         lbl_x, lbl_y = proj(room.cx, room.cy, 0.02)
@@ -893,6 +934,11 @@ def render_heatmap_png_from_snapshot(
             canvas.fill_circle(dome_c[0] - 2, dome_c[1] - 1, 2, hi_col, 0.9)
             label_y = dome_c[1] - dome_ry - 12
             tag = f"T{target.track_id} {int(round(target.confidence * 100))}%"
+
+        if target.motion_state == "stationary":
+            dwell_s = int(round(max(0.0, target.dwell_seconds)))
+            dwell_txt = f"{dwell_s // 60}M" if dwell_s >= 60 else f"{dwell_s}S"
+            tag = f"{tag} RUH {dwell_txt}"
 
         canvas.draw_text(
             base[0] - len(tag) * 3,

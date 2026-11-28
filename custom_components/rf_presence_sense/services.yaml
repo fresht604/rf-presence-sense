@@ -94,6 +94,10 @@ define_room:
       required: false
       selector:
         object:
+    windows:
+      required: false
+      selector:
+        object:
 
 delete_room:
   fields:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from homeassistant.components.binary_sensor import (
@@ -110,12 +111,20 @@ class RFGlobalPresenceBinarySensor(
         self._attr_translation_key = translation_key
         self._attr_icon = icon
         self._attr_device_info = _device_info(entry)
+        self._last_written_sig: tuple[bool, bool] | None = None
 
     @property
     def is_on(self) -> bool:
         if not self.coordinator.data:
             return False
         return int(self.coordinator.data.get(self._key, 0)) > 0
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        sig = (self.available, self.is_on)
+        if sig != self._last_written_sig:
+            self._last_written_sig = sig
+            self.async_write_ha_state()
 
 
 class RFRoomOccupancyBinarySensor(
@@ -149,6 +158,21 @@ class RFRoomOccupancyBinarySensor(
         self._attr_translation_placeholders = {"room": room_name}
         self._attr_icon = icon_map[mode]
         self._attr_device_info = _device_info(entry)
+        self._last_written_sig: tuple[Any, ...] | None = None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        attrs = self.extra_state_attributes
+        sig = (
+            self.available,
+            self.is_on,
+            attrs["humans"],
+            attrs["animals"],
+            json.dumps(attrs["targets"], sort_keys=True, separators=(",", ":")),
+        )
+        if sig != self._last_written_sig:
+            self._last_written_sig = sig
+            self.async_write_ha_state()
 
     @property
     def available(self) -> bool:

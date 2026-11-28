@@ -4,7 +4,7 @@ from __future__ import annotations
 
 DOMAIN = "rf_presence_sense"
 NAME = "RF Presence Sense"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 PLATFORMS = ["sensor", "binary_sensor", "camera", "button", "number"]
 
@@ -29,7 +29,8 @@ CONF_MASK_OUTSIDE_ROOMS = "mask_outside_rooms"
 DEFAULT_FLOOR_WIDTH = 10.0  # meters
 DEFAULT_FLOOR_HEIGHT = 8.0  # meters
 DEFAULT_GRID_RESOLUTION = 0.5  # meters per voxel
-DEFAULT_UPDATE_INTERVAL = 2.0  # seconds
+DEFAULT_UPDATE_INTERVAL = 4.0  # seconds
+MIN_UPDATE_INTERVAL = 2.0  # minimum allowed update interval (seconds)
 DEFAULT_SENSITIVITY = 1.0  # multiplier (0.5 = less sensitive, 2.0 = more sensitive)
 DEFAULT_CALIBRATION_DURATION = 20  # seconds
 DEFAULT_PRESENCE_AWARE_BASELINE = True
@@ -44,6 +45,8 @@ DEFAULT_VARIANCE_WEIGHT = 1.5  # Weight for VRTI sliding-window std dev
 DEFAULT_CONSTRUCTIVE_WEIGHT = 0.35  # Weight for constructive multipath spikes
 DEFAULT_BASELINE_ALPHA = 0.015  # Slow EWMA baseline adaptation rate
 DEFAULT_WINDOW_SECONDS = 12.0  # Sliding window for variance/smoothing
+DEFAULT_LONG_WINDOW_SECONDS = 30.0  # Longer micro-motion/breathing variance window
+LINK_BASELINE_FREEZE_SHADOWING_DB = 1.2  # Freeze per-link baseline when shadowed >= 1.2 dB
 DEFAULT_LINK_STALE_SECONDS = 180.0  # Default fallback stale timeout (BLE)
 STALE_SECONDS_BLE = 180.0  # BLE advertisements stale timeout
 STALE_SECONDS_WIFI = 600.0  # Stationary Wi-Fi RSSI entities report less frequently
@@ -56,7 +59,7 @@ ANIMAL_ATTENUATION_THRESHOLD = 0.65  # Effective attenuation units for pet body
 DETECTION_THRESHOLD_BASE = 0.55  # Base voxel threshold for target detection
 
 # Resource & stability limits (prevent OOM / event-loop stalls on ARM SBCs)
-MAX_VOXELS = 900  # Auto-upscale grid resolution if floorplan exceeds this
+MAX_VOXELS = 500  # Auto-upscale grid resolution if floorplan exceeds this
 MAX_LINKS = 80  # Cap RF links to bound O(M^3) Cholesky & projection memory
 MAX_CALIBRATION_SAMPLES = 200  # Bounded deque per link during calibration
 MAX_FINGERPRINTS = 120  # Bounded RF calibration fingerprints for hybrid fusion
@@ -64,11 +67,20 @@ MAX_REPORTED_FINGERPRINTS = 80  # Compact [x, y] markers exposed to 3D frontend
 MAX_REPORTED_PERTURBATIONS = 20  # Top-N perturbed links in HA state attributes
 MAX_REPORTED_HEATMAP_PEAKS = 30  # Compact heatmap peaks for 3D Lovelace Card
 BLE_MIN_INTERVAL_SECONDS = 0.4  # Minimum interval between BLE samples per link
+REBUILD_COOLDOWN_SECONDS = 8.0  # Min cooldown between automatic dynamic projection rebuilds
+BUS_EVENT_MAX_PER_WINDOW = 10  # Global cap on HA bus events per window
+BUS_EVENT_WINDOW_SECONDS = 60.0  # Sliding window for global HA bus event cap
+ROOM_CHANGE_CONFIRM_TICKS = 2  # Consecutive ticks in new room before firing room_changed
+LINK_HEALTH_HEARTBEAT_SECONDS = 30.0  # Max interval between link_health state writes
 
 # Tracker defaults
 TRACKER_MAX_ASSOC_DIST_M = 2.2
 TRACKER_MIN_HITS = 2
 TRACKER_MAX_MISSED = 4
+TRACKER_MAX_MISSED_STATIONARY = 12  # ~48s hold time at 4s update interval when stationary
+TRACKER_STATIONARY_HYSTERESIS = 0.55  # Confirmed targets hold down to 0.55 * threshold
+TRACKER_STATIONARY_SPEED_MPS = 0.12  # Speed below this counts as stationary
+TRACKER_STATIONARY_DWELL_SECONDS = 10.0  # Min dwell time before state becomes "stationary"
 TRACKER_MAX_TRACKS = 16
 TRACKER_TRAIL_MAXLEN = 15
 

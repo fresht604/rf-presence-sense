@@ -226,6 +226,7 @@ def _register_services(hass: HomeAssistant) -> None:
         polygon = call.data.get("polygon")
         open_edges = call.data.get("open_edges")
         doors = call.data.get("doors")
+        windows = call.data.get("windows")
         for coord in _get_coordinators(hass):
             await coord.async_define_room(
                 room_id,
@@ -237,6 +238,7 @@ def _register_services(hass: HomeAssistant) -> None:
                 polygon=polygon,
                 open_edges=open_edges,
                 doors=doors,
+                windows=windows,
             )
             await coord.async_request_refresh()
 
@@ -343,6 +345,7 @@ def _register_services(hass: HomeAssistant) -> None:
                 ),
                 vol.Optional("open_edges"): vol.All(list, [cv.string]),
                 vol.Optional("doors"): list,
+                vol.Optional("windows"): list,
             }
         ),
     )

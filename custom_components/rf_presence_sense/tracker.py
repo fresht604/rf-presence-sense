@@ -22,8 +22,12 @@ from .const import (
     TARGET_TYPE_HUMAN,
     TRACKER_MAX_ASSOC_DIST_M,
     TRACKER_MAX_MISSED,
+    TRACKER_MAX_MISSED_STATIONARY,
     TRACKER_MAX_TRACKS,
     TRACKER_MIN_HITS,
+    TRACKER_STATIONARY_DWELL_SECONDS,
+    TRACKER_STATIONARY_HYSTERESIS,
+    TRACKER_STATIONARY_SPEED_MPS,
     TRACKER_TRAIL_MAXLEN,
 )
 from .rti_engine import RTIReconstruction
@@ -76,19 +80,24 @@ def _normalize_edge(raw: Any) -> str | None:
     return _EDGE_SHORT_TO_FULL.get(s)
 
 
-def _normalize_doors(raw_doors: Any) -> list[dict[str, Any]]:
-    """Validate and cap door definitions per room."""
-    if not isinstance(raw_doors, list):
+def _normalize_openings(
+    raw_items: Any, *, default_width: float, max_width: float, max_count: int
+) -> list[dict[str, Any]]:
+    """Validate and cap door/window opening definitions per room."""
+    if not isinstance(raw_items, list):
         return []
     result: list[dict[str, Any]] = []
-    for item in raw_doors[:8]:
+    for item in raw_items[:max_count]:
         if isinstance(item, dict):
             edge = _normalize_edge(item.get("edge") or item.get("e"))
             if not edge:
                 continue
             try:
                 pos = max(0.05, min(0.95, float(item.get("pos", item.get("p", 0.5)))))
-                width = max(0.3, min(3.0, float(item.get("width", item.get("w", 0.9)))))
+                width = max(
+                    0.3,
+                    min(max_width, float(item.get("width", item.get("w", default_width)))),
+                )
             except (TypeError, ValueError):
                 continue
             result.append({"edge": edge, "pos": round(pos, 2), "width": round(width, 2)})
@@ -98,16 +107,26 @@ def _normalize_doors(raw_doors: Any) -> list[dict[str, Any]]:
                 continue
             try:
                 pos = max(0.05, min(0.95, float(item[1])))
-                width = max(0.3, min(3.0, float(item[2])))
+                width = max(0.3, min(max_width, float(item[2])))
             except (TypeError, ValueError):
                 continue
             result.append({"edge": edge, "pos": round(pos, 2), "width": round(width, 2)})
     return result
 
 
+def _normalize_doors(raw_doors: Any) -> list[dict[str, Any]]:
+    """Validate and cap door definitions per room."""
+    return _normalize_openings(raw_doors, default_width=0.9, max_width=3.0, max_count=8)
+
+
+def _normalize_windows(raw_windows: Any) -> list[dict[str, Any]]:
+    """Validate and cap window definitions per room."""
+    return _normalize_openings(raw_windows, default_width=1.4, max_width=4.0, max_count=12)
+
+
 @dataclass
 class RoomZone:
-    """Rectangular or arbitrary polygon room zone with optional doors & open passages."""
+    """Rectangular or arbitrary polygon room zone with optional doors, windows & open passages."""
 
     room_id: str
     name: str
@@ -118,6 +137,7 @@ class RoomZone:
     polygon: list[tuple[float, float]] | None = None
     open_edges: list[str] = field(default_factory=list)
     doors: list[dict[str, Any]] = field(default_factory=list)
+    windows: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.polygon is not None and len(self.polygon) >= 3:
@@ -144,6 +164,7 @@ class RoomZone:
                 cleaned_edges.append(norm_e)
         self.open_edges = cleaned_edges
         self.doors = _normalize_doors(self.doors)
+        self.windows = _normalize_windows(self.windows)
 
     def contains(self, x: float, y: float) -> bool:
         """Return True if point (x, y) lies inside this rectangular or polygon room."""
@@ -169,6 +190,8 @@ class RoomZone:
             data["oe"] = [e[0] for e in self.open_edges]
         if self.doors:
             data["dr"] = [[d["edge"][0], d["pos"], d["width"]] for d in self.doors]
+        if self.windows:
+            data["wn"] = [[w["edge"][0], w["pos"], w["width"]] for w in self.windows]
         return data
 
     def to_storage_dict(self) -> dict[str, Any]:
@@ -187,6 +210,8 @@ class RoomZone:
             data["open_edges"] = list(self.open_edges)
         if self.doors:
             data["doors"] = [dict(d) for d in self.doors]
+        if self.windows:
+            data["windows"] = [dict(w) for w in self.windows]
         return data
 
 
@@ -225,6 +250,8 @@ class TrackedTarget:
     room_name: str | None = None
     last_low_energy: float = 0.0
     last_high_energy: float = 0.0
+    motion_state: str = "moving"  # "stationary" (>= 10s with speed < 0.12 m/s) or "moving"
+    dwell_seconds: float = 0.0
     trail: deque[tuple[float, float]] = field(
         default_factory=lambda: deque(maxlen=TRACKER_TRAIL_MAXLEN)
     )
@@ -256,6 +283,8 @@ class TrackedTarget:
             "intensity": round(self.intensity, 2),
             "confidence": round(self.confidence, 2),
             "human_probability": round(self.human_score, 2),
+            "motion": self.motion_state,
+            "dwell_s": int(round(self.dwell_seconds)),
             "room_id": self.room_id,
             "room": self.room_name or "Unbekannt",
             "trail": [[round(px, 2), round(py, 2)] for px, py in self.trail],
@@ -437,6 +466,34 @@ class MultiTargetTracker:
                 return (room.room_id, room.name)
         return (None, None)
 
+    def _apply_peak_update(
+        self, track: TrackedTarget, peak: DetectionPeak, dt: float
+    ) -> None:
+        """Apply Kalman position/velocity and classification update from a matched peak."""
+        r_meas = 0.35
+        k_gain = track.p_pos / (track.p_pos + r_meas)
+        dx = peak.x - track.x
+        dy = peak.y - track.y
+
+        track.x += k_gain * dx
+        track.y += k_gain * dy
+        track.vx = 0.55 * track.vx + 0.45 * (dx / dt)
+        track.vy = 0.55 * track.vy + 0.45 * (dy / dt)
+        track.p_pos = (1.0 - k_gain) * track.p_pos
+        track.intensity = 0.6 * peak.intensity + 0.4 * track.intensity
+        track.last_low_energy = peak.low_energy
+        track.last_high_energy = peak.high_energy
+
+        # Update smoothed human/animal classification
+        inst_human, inst_conf = classify_peak_human_score(peak)
+        track.human_score = 0.70 * track.human_score + 0.30 * inst_human
+        track.confidence = 0.65 * track.confidence + 0.35 * inst_conf
+
+        track.hits += 1
+        track.missed = 0
+        track.room_id, track.room_name = self._find_room(track.x, track.y)
+        track.trail.append((track.x, track.y))
+
     def update(self, recon: RTIReconstruction, dt: float = 2.0) -> list[TrackedTarget]:
         """Run one predict-associate-update cycle and return confirmed targets."""
         dt = max(0.2, min(dt, 15.0))
@@ -477,45 +534,75 @@ class MultiTargetTracker:
                 continue
             matched_tracks.add(tid)
             matched_peaks.add(pidx)
-            track = self._tracks[tid]
-            peak = peaks[pidx]
+            self._apply_peak_update(self._tracks[tid], peaks[pidx], dt)
 
-            # Kalman position & velocity gain
-            r_meas = 0.35
-            k_gain = track.p_pos / (track.p_pos + r_meas)
-            dx = peak.x - track.x
-            dy = peak.y - track.y
+        # 2b. Static-Presence Hysteresis: already confirmed tracks hold down to
+        # 0.55 * detection_threshold so stationary/sleeping targets never flicker.
+        unmatched_confirmed = [
+            (tid, t)
+            for tid, t in self._tracks.items()
+            if tid not in matched_tracks and t.hits >= self.min_hits
+        ]
+        if unmatched_confirmed:
+            hyst_threshold = self.detection_threshold * TRACKER_STATIONARY_HYSTERESIS
+            low_peaks = extract_peaks(
+                recon,
+                threshold=hyst_threshold,
+                max_peaks=self.max_tracks,
+            )
+            hyst_pairs: list[tuple[float, int, int]] = []
+            for tid, track in unmatched_confirmed:
+                for lidx, lpeak in enumerate(low_peaks):
+                    dist = math.hypot(lpeak.x - track.x, lpeak.y - track.y)
+                    if dist <= self.max_assoc_dist:
+                        hyst_pairs.append((dist, tid, lidx))
+            hyst_pairs.sort(key=lambda item: item[0])
+            used_low: set[int] = set()
+            for _, tid, lidx in hyst_pairs:
+                if tid in matched_tracks or lidx in used_low:
+                    continue
+                matched_tracks.add(tid)
+                used_low.add(lidx)
+                self._apply_peak_update(self._tracks[tid], low_peaks[lidx], dt)
 
-            track.x += k_gain * dx
-            track.y += k_gain * dy
-            track.vx = 0.55 * track.vx + 0.45 * (dx / dt)
-            track.vy = 0.55 * track.vy + 0.45 * (dy / dt)
-            track.p_pos = (1.0 - k_gain) * track.p_pos
-            track.intensity = 0.6 * peak.intensity + 0.4 * track.intensity
-            track.last_low_energy = peak.low_energy
-            track.last_high_energy = peak.high_energy
-
-            # Update smoothed human/animal classification
-            inst_human, inst_conf = classify_peak_human_score(peak)
-            track.human_score = 0.70 * track.human_score + 0.30 * inst_human
-            track.confidence = 0.65 * track.confidence + 0.35 * inst_conf
-
-            track.hits += 1
-            track.missed = 0
-            track.room_id, track.room_name = self._find_room(track.x, track.y)
-            track.trail.append((track.x, track.y))
-
-        # 3. Age unmatched tracks
+        # 3. Age unmatched tracks (extended hold time for stationary confirmed targets)
         to_delete: list[int] = []
         for tid, track in self._tracks.items():
             if tid not in matched_tracks:
                 track.missed += 1
-                if track.missed > self.max_missed:
+                is_stationary_confirmed = (
+                    track.hits >= self.min_hits
+                    and (
+                        track.speed_mps < TRACKER_STATIONARY_SPEED_MPS
+                        or track.motion_state == "stationary"
+                    )
+                )
+                max_miss = (
+                    max(self.max_missed, TRACKER_MAX_MISSED_STATIONARY)
+                    if is_stationary_confirmed
+                    else self.max_missed
+                )
+                if track.missed > max_miss:
                     to_delete.append(tid)
         for tid in to_delete:
             del self._tracks[tid]
 
-        # 4. Spawn new tentative tracks for unmatched peaks (bounded by max_tracks)
+        # 3b. Update dwell_seconds and motion_state on all active tracks
+        for track in self._tracks.values():
+            if track.speed_mps < TRACKER_STATIONARY_SPEED_MPS:
+                track.dwell_seconds += dt
+            else:
+                track.dwell_seconds = 0.0
+            track.motion_state = (
+                "stationary"
+                if (
+                    track.dwell_seconds >= TRACKER_STATIONARY_DWELL_SECONDS
+                    and track.speed_mps < TRACKER_STATIONARY_SPEED_MPS
+                )
+                else "moving"
+            )
+
+        # 4. Spawn new tentative tracks ONLY for unmatched primary peaks (bounded by max_tracks)
         for pidx, peak in enumerate(peaks):
             if pidx in matched_peaks:
                 continue
@@ -538,9 +625,16 @@ class MultiTargetTracker:
             self._tracks[self._next_id] = new_track
             self._next_id += 1
 
-        # Return confirmed targets
-        return [
-            t
-            for t in self._tracks.values()
-            if t.hits >= self.min_hits and t.missed <= 2
-        ]
+        # Return confirmed targets (stationary confirmed targets hold up to TRACKER_MAX_MISSED_STATIONARY)
+        confirmed: list[TrackedTarget] = []
+        for t in self._tracks.values():
+            if t.hits < self.min_hits:
+                continue
+            is_stat = (
+                t.speed_mps < TRACKER_STATIONARY_SPEED_MPS
+                or t.motion_state == "stationary"
+            )
+            hold_limit = TRACKER_MAX_MISSED_STATIONARY if is_stat else 2
+            if t.missed <= hold_limit:
+                confirmed.append(t)
+        return confirmed

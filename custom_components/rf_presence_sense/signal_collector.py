@@ -195,7 +195,7 @@ _ROOM_SYNONYM_GROUPS: tuple[tuple[str, ...], ...] = (
     ("wohnzimmer", "wohn", "living", "wz", "sofa", "couch", "govee", "fernseher", "tv"),
     ("kueche", "kitchen", "kue", "fridge", "kuehlschrank", "kuehl", "herd", "ofen", "geschirrspueler"),
     ("schlafzimmer", "schlaf", "bedroom", "sz", "bett", "bed"),
-    ("eingangsbereich", "eingang", "entrance", "briefkasten", "haustuer", "vorraum"),
+    ("eingangsbereich", "eingang", "hauseingang", "entrance", "briefkasten", "haustuer", "vorraum"),
     ("flur", "diele", "gang", "hall", "hallway", "corridor"),
     ("balkon", "terrasse", "balcony", "garten", "garden"),
     ("kinderzimmer", "kinder", "kids", "kz"),
@@ -276,6 +276,20 @@ def infer_room_from_name(
             for room_id, _, _, _, r_groups in room_sigs:
                 if cand_groups & r_groups:
                     return room_id
+            # Fallback: if candidate mentions balkon/terrasse/garten and no balcony room
+            # is configured, map it to wohnzimmer (typically adjacent balcony access).
+            balkon_idx = next(
+                (i for i, g in enumerate(_ROOM_SYNONYM_GROUPS) if "balkon" in g),
+                None,
+            )
+            wz_idx = next(
+                (i for i, g in enumerate(_ROOM_SYNONYM_GROUPS) if "wohnzimmer" in g),
+                None,
+            )
+            if balkon_idx is not None and wz_idx is not None and balkon_idx in cand_groups:
+                for room_id, _, _, _, r_groups in room_sigs:
+                    if wz_idx in r_groups:
+                        return room_id
 
     return None
 
@@ -298,6 +312,35 @@ def infer_height_from_name(
     if is_receiver:
         return 1.20
     return 1.0 if protocol == PROTOCOL_WIFI else 0.95
+
+
+def _lookup_mac_fuzzy(nm: str, mac_to_dev: dict[str, Any]) -> Any | None:
+    """Resolve a normalized 12-hex MAC with ±3 last-byte fallback for ESP32/Shelly Wi-Fi vs BLE MACs."""
+    if not nm:
+        return None
+    exact = mac_to_dev.get(nm)
+    if exact is not None:
+        return exact
+    if len(nm) != 12:
+        return None
+    prefix = nm[:10]
+    try:
+        target_last = int(nm[10:], 16)
+    except ValueError:
+        return None
+    best_dev: Any | None = None
+    best_diff = 4
+    for cand_mac, dev_entry in mac_to_dev.items():
+        if len(cand_mac) != 12 or cand_mac[:10] != prefix:
+            continue
+        try:
+            diff = abs(int(cand_mac[10:], 16) - target_last)
+        except ValueError:
+            continue
+        if diff <= 3 and diff < best_diff:
+            best_diff = diff
+            best_dev = dev_entry
+    return best_dev
 
 
 def discover_devices_and_receivers_metadata(
@@ -324,11 +367,40 @@ def discover_devices_and_receivers_metadata(
             area_entry = area_reg.async_get_area(area_id)
             return str(area_entry.name) if area_entry and area_entry.name else ""
 
+        # Collect all HA device entries via official Area/Device Registry API first
+        # (HA 2025/2026 dev_reg.devices is DeviceRegistryItems, NOT a plain dict!),
+        # then merge any remaining devices via .values() duck-typing fallback.
+        all_dev_entries: list[Any] = []
+        seen_dev_keys: set[Any] = set()
+
+        def _add_dev_entry(entry_obj: Any) -> None:
+            key = getattr(entry_obj, "id", None) or id(entry_obj)
+            if key not in seen_dev_keys:
+                seen_dev_keys.add(key)
+                all_dev_entries.append(entry_obj)
+
+        if (
+            dev_reg is not None
+            and area_reg is not None
+            and hasattr(area_reg, "async_list_areas")
+            and hasattr(dr, "async_entries_for_area")
+        ):
+            for area_obj in area_reg.async_list_areas():
+                area_id = getattr(area_obj, "id", None)
+                if not area_id:
+                    continue
+                for dev_entry in dr.async_entries_for_area(dev_reg, area_id):
+                    _add_dev_entry(dev_entry)
+
+        raw_devs = getattr(dev_reg, "devices", None) if dev_reg is not None else None
+        if raw_devs is not None and hasattr(raw_devs, "values"):
+            for dev_entry in raw_devs.values():
+                _add_dev_entry(dev_entry)
+
         # Build fast MAC -> device_entry lookup across all registered HA devices
         mac_to_dev: dict[str, Any] = {}
         name_to_dev: dict[str, Any] = {}
-        raw_devs = getattr(dev_reg, "devices", None) if dev_reg is not None else None
-        for dev_entry in (raw_devs.values() if isinstance(raw_devs, dict) else ()):
+        for dev_entry in all_dev_entries:
             for _ctype, cval in getattr(dev_entry, "connections", None) or ():
                 nm = _norm_mac(str(cval))
                 if nm:
@@ -379,7 +451,7 @@ def discover_devices_and_receivers_metadata(
             if not info.get("area") or not info.get("name"):
                 nm = _norm_mac(item_id)
                 dev_entry = (
-                    mac_to_dev.get(nm)
+                    _lookup_mac_fuzzy(nm, mac_to_dev)
                     if nm
                     else name_to_dev.get(str(item_id).lower())
                 )

@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import json
+import time
 from typing import Any
 
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, NAME, VERSION
+from .const import DOMAIN, LINK_HEALTH_HEARTBEAT_SECONDS, NAME, VERSION
 from .coordinator import RFPresenceCoordinator
 
 
@@ -81,12 +83,20 @@ class RFCountSensor(CoordinatorEntity[RFPresenceCoordinator], SensorEntity):
         self._attr_translation_key = translation_key
         self._attr_icon = icon
         self._attr_device_info = _device_info(entry)
+        self._last_written_sig: tuple[bool, int] | None = None
 
     @property
     def native_value(self) -> int:
         if not self.coordinator.data:
             return 0
         return int(self.coordinator.data.get(self._key, 0))
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        sig = (self.available, self.native_value)
+        if sig != self._last_written_sig:
+            self._last_written_sig = sig
+            self.async_write_ha_state()
 
 
 class RFTargetsDetailSensor(CoordinatorEntity[RFPresenceCoordinator], SensorEntity):
@@ -123,6 +133,17 @@ class RFTargetsDetailSensor(CoordinatorEntity[RFPresenceCoordinator], SensorEnti
         super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_targets_detail"
         self._attr_device_info = _device_info(entry)
+        self._last_written_sig: tuple[bool, str, str] | None = None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        attrs_key = json.dumps(
+            self.extra_state_attributes, sort_keys=True, separators=(",", ":")
+        )
+        sig = (self.available, self.native_value, attrs_key)
+        if sig != self._last_written_sig:
+            self._last_written_sig = sig
+            self.async_write_ha_state()
 
     @property
     def native_value(self) -> str:
@@ -212,6 +233,28 @@ class RFLinkHealthSensor(CoordinatorEntity[RFPresenceCoordinator], SensorEntity)
         super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_link_health"
         self._attr_device_info = _device_info(entry)
+        self._last_written_sig: tuple[Any, ...] | None = None
+        self._last_write_ts: float = 0.0
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        data = self.coordinator.data or {}
+        perts = data.get("link_perturbations") or {}
+        sig = (
+            self.available,
+            float(data.get("link_health_pct", 0.0)),
+            int(data.get("active_links", 0)),
+            int(data.get("total_links", 0)),
+            tuple(sorted(perts.items())) if isinstance(perts, dict) else (),
+        )
+        now = time.monotonic()
+        if (
+            sig != self._last_written_sig
+            or (now - self._last_write_ts) >= LINK_HEALTH_HEARTBEAT_SECONDS
+        ):
+            self._last_written_sig = sig
+            self._last_write_ts = now
+            self.async_write_ha_state()
 
     @property
     def native_value(self) -> float:

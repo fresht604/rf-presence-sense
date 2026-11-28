@@ -632,5 +632,316 @@ class TestRecorderProtectionAndCoordinator(unittest.TestCase):
         coord.async_shutdown_collector()
 
 
+class TestARM64HardeningAndHA2026Fixes(unittest.TestCase):
+    """Tests for ARM64 OOM/CPU hardening, state-change gating, event throttling & HA 2026 fixes."""
+
+    def test_defaults_and_minimum_update_interval_and_max_voxels(self) -> None:
+        """DEFAULT_UPDATE_INTERVAL=4.0s, MIN=2.0s, MAX_VOXELS=500 enforced on coordinator."""
+        self.assertEqual(_const.DEFAULT_UPDATE_INTERVAL, 4.0)
+        self.assertEqual(_const.MIN_UPDATE_INTERVAL, 2.0)
+        self.assertEqual(_const.MAX_VOXELS, 500)
+
+        hass = _FakeHass()
+        entry = types.SimpleNamespace(
+            entry_id="clamp_test",
+            data={
+                "enable_ble": False,
+                "enable_wifi_entities": False,
+                "update_interval": 0.5,
+                "floor_width": 10.0,
+                "floor_height": 10.0,
+                "grid_resolution": 0.5,
+            },
+            options={},
+        )
+        coord = _coordinator_mod.RFPresenceCoordinator(hass, entry)
+        self.assertEqual(coord.update_interval.total_seconds(), 2.0)
+        # 10x10m @ 0.5m = 400 voxels <= 500 -> keeps 0.5m resolution
+        self.assertEqual(coord.engine.num_voxels, 400)
+        self.assertEqual(coord.engine.resolution, 0.5)
+        coord.async_shutdown_collector()
+
+    def test_state_change_gating_on_sensors_and_binary_sensors(self) -> None:
+        """Entities must only call async_write_ha_state when relevant state/attrs change."""
+        entry = types.SimpleNamespace(entry_id="gate_test")
+        room = _tracker.RoomZone(
+            room_id="wz", name="Wohnzimmer", x_min=0.0, y_min=0.0, x_max=5.0, y_max=5.0
+        )
+        coord = types.SimpleNamespace(
+            data={
+                "humans_count": 0,
+                "animals_count": 0,
+                "total_targets": 0,
+                "calibrating": False,
+                "targets": [],
+                "rooms": {
+                    "wz": {
+                        "name": "Wohnzimmer",
+                        "occupied": False,
+                        "human_detected": False,
+                        "animal_detected": False,
+                        "humans": 0,
+                        "animals": 0,
+                        "targets": [],
+                    }
+                },
+                "rooms_geometry": [],
+                "geometry": {},
+                "devices": [],
+                "receivers": [],
+                "active_links_3d": [],
+                "heatmap_peaks": [],
+                "active_links": 5,
+                "total_links": 5,
+                "link_health_pct": 100.0,
+                "packets_received": 10,
+                "link_perturbations": {},
+                "fingerprint_count": 0,
+                "edge_walk_active": False,
+                "fingerprints_xy": [],
+            },
+            rooms=[room],
+            sensitivity=1.0,
+            calibration_duration=20,
+            presence_aware_baseline=True,
+            mask_outside_rooms=True,
+        )
+
+        count_s = _sensor_mod.RFCountSensor(coord, entry, "humans_count", "humans_count", "mdi:account")
+        health_s = _sensor_mod.RFLinkHealthSensor(coord, entry)
+        detail_s = _sensor_mod.RFTargetsDetailSensor(coord, entry)
+        global_bs = _binary_sensor_mod.RFGlobalPresenceBinarySensor(
+            coord, entry, "humans_count", "human_detected", "mdi:motion-sensor"
+        )
+        room_bs = _binary_sensor_mod.RFRoomOccupancyBinarySensor(
+            coord, entry, "wz", "Wohnzimmer", mode="occupied"
+        )
+
+        writes: dict[str, int] = {"count": 0, "health": 0, "detail": 0, "global": 0, "room": 0}
+        count_s.async_write_ha_state = lambda: writes.__setitem__("count", writes["count"] + 1)
+        health_s.async_write_ha_state = lambda: writes.__setitem__("health", writes["health"] + 1)
+        detail_s.async_write_ha_state = lambda: writes.__setitem__("detail", writes["detail"] + 1)
+        global_bs.async_write_ha_state = lambda: writes.__setitem__("global", writes["global"] + 1)
+        room_bs.async_write_ha_state = lambda: writes.__setitem__("room", writes["room"] + 1)
+
+        with patch("time.monotonic", return_value=100.0):
+            for ent in (count_s, health_s, detail_s, global_bs, room_bs):
+                ent._handle_coordinator_update()
+        self.assertEqual(writes, {"count": 1, "health": 1, "detail": 1, "global": 1, "room": 1})
+
+        # Unchanged state + incremented packets_received within 30s -> ZERO writes!
+        coord.data["packets_received"] = 25
+        with patch("time.monotonic", return_value=108.0):
+            for ent in (count_s, health_s, detail_s, global_bs, room_bs):
+                ent._handle_coordinator_update()
+        self.assertEqual(writes, {"count": 1, "health": 1, "detail": 1, "global": 1, "room": 1})
+
+        # After 31s -> RFLinkHealthSensor heartbeat writes once; others still 1
+        coord.data["packets_received"] = 40
+        with patch("time.monotonic", return_value=131.0):
+            for ent in (count_s, health_s, detail_s, global_bs, room_bs):
+                ent._handle_coordinator_update()
+        self.assertEqual(writes, {"count": 1, "health": 2, "detail": 1, "global": 1, "room": 1})
+
+        # Now a human appears in Wohnzimmer -> count, detail, global, room write; health unchanged
+        coord.data["humans_count"] = 1
+        coord.data["rooms"]["wz"]["occupied"] = True
+        coord.data["rooms"]["wz"]["humans"] = 1
+        with patch("time.monotonic", return_value=135.0):
+            for ent in (count_s, health_s, detail_s, global_bs, room_bs):
+                ent._handle_coordinator_update()
+        self.assertEqual(writes, {"count": 2, "health": 2, "detail": 2, "global": 2, "room": 2})
+
+    def test_bus_event_rate_limit_and_room_change_debounce(self) -> None:
+        """Bus events must cap at 10 per 60s and ignore 1-tick room-change flickers."""
+        hass = _FakeHass()
+        hass.bus = types.SimpleNamespace(
+            events=[],
+            async_fire=lambda etype, edata: hass.bus.events.append((etype, edata)),
+        )
+        entry = types.SimpleNamespace(
+            entry_id="rate_test",
+            data={"enable_ble": False, "enable_wifi_entities": False},
+            options={},
+        )
+        coord = _coordinator_mod.RFPresenceCoordinator(hass, entry)
+
+        t_wz = _tracker.TrackedTarget(track_id=1, x=1.0, y=1.0, human_score=0.9, room_id="wz", room_name="Wohnzimmer")
+        t_ku = _tracker.TrackedTarget(track_id=1, x=6.0, y=1.0, human_score=0.9, room_id="ku", room_name="Küche")
+
+        # Detect in wz
+        coord._fire_target_events([t_wz], now=100.0)
+        self.assertEqual(len(hass.bus.events), 1)
+        # 1-tick flicker to ku and back to wz -> NO room_changed event!
+        coord._fire_target_events([t_ku], now=104.0)
+        coord._fire_target_events([t_wz], now=108.0)
+        self.assertEqual(len(hass.bus.events), 1)
+
+        # Flood 20 distinct new targets within 10s -> capped at 10 total bus events in 60s
+        for idx in range(2, 22):
+            t_new = _tracker.TrackedTarget(
+                track_id=idx, x=2.0, y=2.0, human_score=0.9, room_id="wz", room_name="Wohnzimmer"
+            )
+            coord._fire_target_events([t_wz, t_new], now=110.0 + idx * 0.2)
+        self.assertEqual(len(hass.bus.events), _const.BUS_EVENT_MAX_PER_WINDOW)
+
+        # After >60s window expires, new events are allowed again
+        t_after = _tracker.TrackedTarget(
+            track_id=99, x=2.0, y=2.0, human_score=0.9, room_id="wz", room_name="Wohnzimmer"
+        )
+        coord._fire_target_events([t_wz, t_after], now=200.0)
+        self.assertGreater(len(hass.bus.events), _const.BUS_EVENT_MAX_PER_WINDOW)
+        coord.async_shutdown_collector()
+
+    def test_projection_rebuild_debounced_for_dynamic_links_and_forced_for_user(self) -> None:
+        """Dynamic links respect 8s cooldown; explicit updates force immediate rebuild."""
+        engine = RTIEngine(floor_width=6.0, floor_height=6.0, resolution=1.0)
+        l1 = RFLink("d1->r1", "d1", "r1", "ble", Point3D(1.0, 1.0, 1.0), Point3D(5.0, 5.0, 1.0))
+        engine.add_or_update_link(l1, dynamic=False)
+        with patch("time.monotonic", return_value=100.0):
+            self.assertTrue(engine.rebuild_projection(force=False))
+
+        # Dynamic link added 2s later -> debounced!
+        l2 = RFLink("d1->r2", "d1", "r2", "ble", Point3D(1.0, 1.0, 1.0), Point3D(5.0, 1.0, 1.0))
+        engine.add_or_update_link(l2, dynamic=True)
+        with patch("time.monotonic", return_value=102.0):
+            self.assertFalse(engine.rebuild_projection(force=False))
+            self.assertTrue(engine._dirty_geometry)
+
+        # Explicit force=True bypasses cooldown
+        with patch("time.monotonic", return_value=103.0):
+            self.assertTrue(engine.rebuild_projection(force=True))
+            self.assertFalse(engine._dirty_geometry)
+
+        # Another dynamic link: after cooldown (>= 8s) it rebuilds automatically
+        l3 = RFLink("d1->r3", "d1", "r3", "ble", Point3D(1.0, 1.0, 1.0), Point3D(1.0, 5.0, 1.0))
+        engine.add_or_update_link(l3, dynamic=True)
+        with patch("time.monotonic", return_value=112.0):
+            self.assertTrue(engine.rebuild_projection(force=False))
+            self.assertFalse(engine._dirty_geometry)
+
+    def test_overlapping_executor_reconstruction_skipped(self) -> None:
+        """If _reconstructing is True, a concurrent _async_update_data must skip cleanly."""
+        hass = _FakeHass()
+        entry = types.SimpleNamespace(
+            entry_id="overlap_test",
+            data={"enable_ble": False, "enable_wifi_entities": False},
+            options={},
+        )
+        coord = _coordinator_mod.RFPresenceCoordinator(hass, entry)
+        coord.data = {"sentinel": True}
+        coord._reconstructing = True
+
+        async def _run() -> None:
+            res = await coord._async_update_data()
+            self.assertEqual(res, {"sentinel": True})
+            self.assertEqual(hass.executor_calls, [])
+
+        _run_async(_run())
+        coord._reconstructing = False
+        coord.async_shutdown_collector()
+
+    def test_ha2026_device_registry_items_and_esp32_mac_offset_and_room_fallbacks(self) -> None:
+        """Support non-dict DeviceRegistryItems, ESP32 ±3 MAC offset, balkon->wohnzimmer & hauseingang."""
+        from collections import UserDict
+        import sys
+
+        class FakeDeviceRegistryItems(UserDict):
+            """Mimics HA 2025/2026 DeviceRegistryItems (not an instance of dict)."""
+
+        area_wz = types.SimpleNamespace(id="area_wz", name="Wohnzimmer")
+        area_eb = types.SimpleNamespace(id="area_eb", name="Eingangsbereich")
+        shelly_dev = types.SimpleNamespace(
+            id="dev_shelly_1",
+            name="Shelly Plus Plug WZ",
+            name_by_user=None,
+            area_id="area_wz",
+            connections={("mac", "A0:DD:6C:12:34:56")},
+            identifiers={("shelly", "shellyplusplugs-a0dd6c123456")},
+        )
+        extra_dev = types.SimpleNamespace(
+            id="dev_no_area",
+            name="Shelly Flur",
+            name_by_user="Shelly Hauseingang",
+            area_id="area_eb",
+            connections={("mac", "B0:AA:11:22:33:44")},
+            identifiers=set(),
+        )
+        fake_dev_reg = types.SimpleNamespace(
+            devices=FakeDeviceRegistryItems(
+                {"dev_shelly_1": shelly_dev, "dev_no_area": extra_dev}
+            ),
+            async_get=lambda did: fake_dev_reg.devices.get(did),
+        )
+        fake_area_reg = types.SimpleNamespace(
+            async_list_areas=lambda: [area_wz, area_eb],
+            async_get_area=lambda aid: {"area_wz": area_wz, "area_eb": area_eb}.get(aid),
+        )
+        fake_ent_reg = types.SimpleNamespace(async_get=lambda _eid: None)
+
+        ar_mod = types.ModuleType("homeassistant.helpers.area_registry")
+        ar_mod.async_get = lambda _h: fake_area_reg  # type: ignore[attr-defined]
+        dr_mod = types.ModuleType("homeassistant.helpers.device_registry")
+        dr_mod.async_get = lambda _h: fake_dev_reg  # type: ignore[attr-defined]
+        dr_mod.async_entries_for_area = lambda reg, aid: [  # type: ignore[attr-defined]
+            d for d in reg.devices.values() if d.area_id == aid
+        ]
+        er_mod = types.ModuleType("homeassistant.helpers.entity_registry")
+        er_mod.async_get = lambda _h: fake_ent_reg  # type: ignore[attr-defined]
+
+        orig_ar = sys.modules.get("homeassistant.helpers.area_registry")
+        orig_dr = sys.modules.get("homeassistant.helpers.device_registry")
+        orig_er = sys.modules.get("homeassistant.helpers.entity_registry")
+        sys.modules["homeassistant.helpers.area_registry"] = ar_mod
+        sys.modules["homeassistant.helpers.device_registry"] = dr_mod
+        sys.modules["homeassistant.helpers.entity_registry"] = er_mod
+        try:
+            # Verify our container is indeed NOT a dict
+            self.assertFalse(isinstance(fake_dev_reg.devices, dict))
+            meta = _collector_mod.discover_devices_and_receivers_metadata(
+                _FakeHass(),
+                # BLE MAC +2 offset from Shelly Wi-Fi MAC (:56 -> :58), plus +4 out-of-range (:5A)
+                device_ids=["A0:DD:6C:12:34:58", "A0:DD:6C:12:34:5A"],
+                # BLE Proxy MAC -2 offset (:44 -> :42)
+                receiver_ids=["B0:AA:11:22:33:42"],
+            )
+            self.assertEqual(meta["A0:DD:6C:12:34:58"]["area"], "Wohnzimmer")
+            self.assertEqual(meta["A0:DD:6C:12:34:58"]["name"], "Shelly Plus Plug WZ")
+            self.assertNotIn("A0:DD:6C:12:34:5A", meta)
+            self.assertEqual(meta["B0:AA:11:22:33:42"]["area"], "Eingangsbereich")
+            self.assertEqual(meta["B0:AA:11:22:33:42"]["name"], "Shelly Hauseingang")
+        finally:
+            for name, orig in (
+                ("homeassistant.helpers.area_registry", orig_ar),
+                ("homeassistant.helpers.device_registry", orig_dr),
+                ("homeassistant.helpers.entity_registry", orig_er),
+            ):
+                if orig is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = orig
+
+        # Room inference fallbacks: balkon -> wohnzimmer (when no balkon room), hauseingang -> eingangsbereich
+        rooms_no_balcony = [
+            _tracker.RoomZone("wohnzimmer", "Wohnzimmer", 0, 0, 5, 5),
+            _tracker.RoomZone("eingangsbereich", "Eingangsbereich", 5, 0, 7, 3),
+        ]
+        self.assertEqual(
+            _collector_mod.infer_room_from_name("Shelly Balkon", rooms_no_balcony),
+            "wohnzimmer",
+        )
+        self.assertEqual(
+            _collector_mod.infer_room_from_name("Hauseingang Licht", rooms_no_balcony),
+            "eingangsbereich",
+        )
+        rooms_with_balcony = rooms_no_balcony + [
+            _tracker.RoomZone("balkon", "Balkon", 0, 5, 5, 7)
+        ]
+        self.assertEqual(
+            _collector_mod.infer_room_from_name("Shelly Balkon", rooms_with_balcony),
+            "balkon",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

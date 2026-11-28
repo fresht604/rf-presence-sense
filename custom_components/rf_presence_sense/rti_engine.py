@@ -29,16 +29,19 @@ from .const import (
     DEFAULT_CORRELATION_DIST_M,
     DEFAULT_ELLIPSE_EXCESS_M,
     DEFAULT_LINK_STALE_SECONDS,
+    DEFAULT_LONG_WINDOW_SECONDS,
     DEFAULT_NOISE_VARIANCE,
     DEFAULT_SIGNAL_VARIANCE,
     DEFAULT_VARIANCE_WEIGHT,
     DEFAULT_WINDOW_SECONDS,
+    LINK_BASELINE_FREEZE_SHADOWING_DB,
     LOW_HEIGHT_THRESHOLD_M,
     MAX_CALIBRATION_SAMPLES,
     MAX_FINGERPRINTS,
     MAX_LINKS,
     MAX_VOXELS,
     PROTOCOL_STALE_SECONDS,
+    REBUILD_COOLDOWN_SECONDS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -97,6 +100,9 @@ class RFLink:
     samples: deque[tuple[float, float]] = field(
         default_factory=lambda: deque(maxlen=60)
     )
+    long_samples: deque[tuple[float, float]] = field(
+        default_factory=lambda: deque(maxlen=90)
+    )
     baseline_rssi: float | None = None
     baseline_std: float = 0.6
     last_rssi: float | None = None
@@ -150,11 +156,16 @@ class RFLink:
         self.last_rssi = val
         self.last_updated = ts
         self.samples.append((ts, val))
+        self.long_samples.append((ts, val))
 
         # Prune old samples outside the sliding window (keep at least 3)
         cutoff = ts - window_seconds
         while len(self.samples) > 3 and self.samples[0][0] < cutoff:
             self.samples.popleft()
+
+        long_cutoff = ts - DEFAULT_LONG_WINDOW_SECONDS
+        while len(self.long_samples) > 3 and self.long_samples[0][0] < long_cutoff:
+            self.long_samples.popleft()
 
         if calibrating:
             self.calibration_samples.append(val)
@@ -166,6 +177,21 @@ class RFLink:
 
         # Presence-aware baseline: skip drift when targets/presence freeze adaptation
         if freeze_baseline:
+            return
+
+        # Per-link baseline freeze: never adapt baseline while shadowed >= 1.2 dB
+        # (protects stationary/sleeping persons even before a track is confirmed)
+        inst_shadowing = self.baseline_rssi - val
+        recent_vals = [v for _, v in list(self.samples)[-3:]]
+        smooth_shadowing = (
+            self.baseline_rssi - (sum(recent_vals) / len(recent_vals))
+            if recent_vals
+            else inst_shadowing
+        )
+        if (
+            inst_shadowing >= LINK_BASELINE_FREEZE_SHADOWING_DB
+            or smooth_shadowing >= LINK_BASELINE_FREEZE_SHADOWING_DB
+        ):
             return
 
         # Adaptive baseline: only drift slowly when link appears quiet
@@ -231,14 +257,30 @@ class RFLink:
         # 2. Constructive multipath spike (signal jump significantly above baseline)
         constructive = max(0.0, smooth_rssi - self.baseline_rssi - 1.5)
 
-        # 3. Sliding-window standard deviation (VRTI)
+        # 3. Sliding-window standard deviation (12s VRTI + 30s micro-motion/breathing)
         if len(vals) >= 2:
             mean_w = sum(vals) / len(vals)
             var_w = sum((v - mean_w) ** 2 for v in vals) / (len(vals) - 1)
             std_w = math.sqrt(var_w)
         else:
             std_w = 0.0
-        excess_std = max(0.0, std_w - self.baseline_std)
+
+        long_vals = [
+            v
+            for t_s, v in self.long_samples
+            if (ts - t_s) <= DEFAULT_LONG_WINDOW_SECONDS
+        ]
+        if len(long_vals) >= 3:
+            mean_l = sum(long_vals) / len(long_vals)
+            var_l = sum((v - mean_l) ** 2 for v in long_vals) / (len(long_vals) - 1)
+            std_l = math.sqrt(var_l)
+        else:
+            std_l = 0.0
+
+        excess_std = max(
+            max(0.0, std_w - self.baseline_std),
+            0.85 * max(0.0, std_l - self.baseline_std),
+        )
 
         total = (
             shadowing
@@ -382,6 +424,9 @@ class RTIEngine:
             [0.0] * self.cols for _ in range(self.rows)
         ]
         self._dirty_geometry = True
+        self._force_rebuild = True
+        self._last_rebuild_ts: float = 0.0
+        self._rebuild_cooldown: float = REBUILD_COOLDOWN_SECONDS
 
         # Room mask (True = inside any configured room; None = unmasked)
         self._voxel_mask: list[bool] | None = None
@@ -524,10 +569,12 @@ class RTIEngine:
                     vec[lid] = round(pert, 3)
         return vec
 
-    def add_or_update_link(self, link: RFLink) -> bool:
+    def add_or_update_link(self, link: RFLink, *, dynamic: bool = False) -> bool:
         """Register or update an RF link, preserving existing signal history.
 
         Returns False if the link was rejected due to MAX_LINKS capacity limit.
+        When ``dynamic=True`` (auto-discovered roaming/proxy link), projection rebuilds
+        respect ``_rebuild_cooldown`` instead of re-inverting on every tick.
         """
         with self._lock:
             existing = self.links.get(link.link_id)
@@ -542,6 +589,7 @@ class RTIEngine:
 
             if existing is not None:
                 link.samples = existing.samples
+                link.long_samples = existing.long_samples
                 if link.baseline_rssi is None:
                     link.baseline_rssi = existing.baseline_rssi
                     link.baseline_std = existing.baseline_std
@@ -550,6 +598,8 @@ class RTIEngine:
                 link.calibration_samples = existing.calibration_samples
             self.links[link.link_id] = link
             self._dirty_geometry = True
+            if not dynamic:
+                self._force_rebuild = True
             self._geometry_version += 1
             return True
 
@@ -559,6 +609,7 @@ class RTIEngine:
             if link_id in self.links:
                 del self.links[link_id]
                 self._dirty_geometry = True
+                self._force_rebuild = True
                 self._geometry_version += 1
                 if len(self.links) < MAX_LINKS:
                     self._max_links_warned = False
@@ -571,6 +622,7 @@ class RTIEngine:
                 del self.links[lid]
             if stale:
                 self._dirty_geometry = True
+                self._force_rebuild = True
                 self._geometry_version += 1
                 if len(self.links) < MAX_LINKS:
                     self._max_links_warned = False
@@ -731,14 +783,25 @@ class RTIEngine:
             ]
         return []
 
-    def rebuild_projection(self) -> None:
+    def rebuild_projection(self, *, force: bool = False) -> bool:
         """Precompute the Woodbury dual RTI projection matrix Pi = C_x W^T (W C_x W^T + sigma_n^2 I)^-1.
 
         Computes B = C_x W^T on-the-fly over sparse non-zero voxels without
         allocating or storing an N x N spatial covariance matrix in RAM.
         Heavy math executes completely outside self._lock.
+
+        Returns True if the projection matrix was rebuilt, False if debounced.
         """
+        now_mono = time.monotonic()
         with self._lock:
+            if (
+                not force
+                and not self._force_rebuild
+                and self._projection_matrix
+                and self._last_rebuild_ts > 0.0
+                and (now_mono - self._last_rebuild_ts) < self._rebuild_cooldown
+            ):
+                return False
             geo_version = self._geometry_version
             link_order = list(self.links.keys())
             link_specs = [
@@ -765,9 +828,11 @@ class RTIEngine:
                 self._projection_matrix = []
                 self._low_coverage = low_cov
                 self._high_coverage = high_cov
+                self._last_rebuild_ts = time.monotonic()
                 if self._geometry_version == geo_version:
                     self._dirty_geometry = False
-            return
+                    self._force_rebuild = False
+            return True
 
         # Step 1: Compute sparse Fresnel weights and voxel-exact 3D vertical coverage maps
         sparse_weights: list[list[tuple[int, float, bool]]] = []
@@ -838,13 +903,16 @@ class RTIEngine:
             self._projection_matrix = Pi
             self._low_coverage = low_cov
             self._high_coverage = high_cov
+            self._last_rebuild_ts = time.monotonic()
             if self._geometry_version == geo_version:
                 self._dirty_geometry = False
+                self._force_rebuild = False
+        return True
 
     def reconstruct(self, now: float | None = None) -> RTIReconstruction:
         """Reconstruct 2D attenuation heatmap and voxel-accurate 3D vertical layer energy maps."""
         if self._dirty_geometry:
-            self.rebuild_projection()
+            self.rebuild_projection(force=False)
 
         ts = time.monotonic() if now is None else now
 

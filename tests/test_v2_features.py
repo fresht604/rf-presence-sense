@@ -257,12 +257,12 @@ class TestAccuracyAndEvents(unittest.TestCase):
         )
         link.baseline_rssi = -60.0
         for i in range(20):
-            link.add_sample(-61.2, now=10.0 + i, freeze_baseline=True)
+            link.add_sample(-60.9, now=10.0 + i, freeze_baseline=True)
         self.assertEqual(link.baseline_rssi, -60.0)
 
-        # When unfrozen, small deviation drifts slowly toward -61.2
+        # When unfrozen, small ambient deviation (< 1.2 dB freeze threshold) drifts slowly toward -60.9
         for i in range(20):
-            link.add_sample(-61.2, now=40.0 + i, freeze_baseline=False)
+            link.add_sample(-60.9, now=40.0 + i, freeze_baseline=False)
         self.assertLess(link.baseline_rssi, -60.15)
 
     def test_protocol_specific_stale_timeouts(self) -> None:
@@ -329,7 +329,12 @@ class TestAccuracyAndEvents(unittest.TestCase):
         coord._fire_target_events([t1_room_a])
         self.assertEqual(len(hass.bus.events), count_before)
 
-        # Tick 3: Room changed
+        # Tick 3a: First tick in new room -> debounced, no room_changed yet
+        count_before = len(hass.bus.events)
+        coord._fire_target_events([t1_room_b])
+        self.assertEqual(len(hass.bus.events), count_before)
+
+        # Tick 3b: Second consecutive tick in new room -> room_changed fires
         coord._fire_target_events([t1_room_b])
         self.assertEqual(hass.bus.events[-1][0], _const.EVENT_ROOM_CHANGED)
         self.assertEqual(hass.bus.events[-1][1]["from_room_id"], "wz")

@@ -194,7 +194,8 @@
         "y_max": { "name": "Y Max (m)" },
         "polygon": { "name": "Polygon-Eckpunkte (optional)", "description": "Optionale Liste von [x, y]-Paaren für L-förmige oder freie Räume." },
         "open_edges": { "name": "Offene Durchgänge (optional)", "description": "Kanten ohne Wand: north, south, east, west." },
-        "doors": { "name": "Türen (optional)", "description": "Liste von Türöffnungen, z. B. [{edge: south, pos: 0.5, width: 0.9}]." }
+        "doors": { "name": "Türen (optional)", "description": "Liste von Türöffnungen mit Kante (north, south, east, west), Position (0.0 bis 1.0) und Breite in Metern." },
+        "windows": { "name": "Fenster (optional)", "description": "Liste von Fenstern mit Kante (north, south, east, west), Position (0.0 bis 1.0) und Breite in Metern." }
       }
     },
     "delete_room": {
